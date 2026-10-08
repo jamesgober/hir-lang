@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "hir-lang"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -45,13 +45,19 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
+# The standard library. Without it the crate is `no_std` and needs only `alloc`.
+std = ["span-lang/std", "intern-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# First-party -lang dependencies are wired at v0.2.0, when first used.
+# Origins: every node records a `Span` in the session's global byte space. 0.4 is
+# the version syntax-lang and diag-lang use, so spans pass between them unchanged.
+span-lang = { version = "0.4", default-features = false }
+# Names: identifiers are interned `Symbol`s (4 bytes, integer compare), shared with
+# macro-lang, so hygiene marks and names line up across the front end.
+intern-lang = { version = "1", default-features = false }
 
 
 # DEV DEPENDENCIES
