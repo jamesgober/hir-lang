@@ -9,17 +9,18 @@
 //! Every traversal is driven by an explicit stack: native stack use is constant
 //! whatever the nesting depth.
 
-use alloc::vec::Vec;
+use alloc::{collections::BTreeSet, vec::Vec};
 
 use crate::{
-    ArgKind,
-    expr::{Arm, Capture, Expr, Stmt},
-    id::{BinderId, ExprId, ItemId, List, NodeRef, TyId},
-    item::{GenericParam, Generics, ItemKind},
+    expr::{Arg, ArgKind, Arm, Capture, Expr, Stmt},
+    id::{BinderId, ExprId, ItemId, List, NodeRef, ParamId, PatId, StmtId, TyId},
+    intrinsic::AsmOperand,
+    item::{GenericParam, Generics, ItemKind, MixinRule},
+    name::Ns,
     origin::Ident,
     pat::Pat,
     store::Store,
-    ty::Ty,
+    ty::{Bound, GenericArg, Ty},
 };
 
 /// One step of a canonical traversal.
@@ -43,6 +44,9 @@ pub(crate) enum BindSite {
 pub(crate) enum FrameOf {
     Item(ItemId),
     Closure(ExprId),
+    /// A parameter default; the owner (function or closure) decides when it
+    /// is evaluated.
+    Default(ParamId),
     /// A constant context; `integer` when its value is an integer by
     /// definition (array length, const generic argument, discriminant).
     Const {
@@ -62,10 +66,14 @@ pub(crate) enum Group {
     Capture(Capture),
     FieldInit(Ident),
     Entry,
-    Arg(ArgKind),
+    Arg(Arg),
     FieldPat(Ident),
     SliceRest,
     SegmentArgs(u32),
+    Binding(Ident),
+    Constraint(Ident),
+    AsmOperand(AsmOperand),
+    MixinRule(MixinRule),
 }
 
 /// Points of interest between child visits.
@@ -77,10 +85,14 @@ pub(crate) enum Mark {
     PopScope,
     /// The generic parameters' binders become visible.
     Generics(List<GenericParam>),
-    /// The binders of the last completed root pattern become visible.
-    Bind(BindSite),
+    /// The binders of a construct's root pattern become visible.
+    Bind(BindSite, PatId),
+    /// A declaration's binder (`static`, `global`) becomes visible.
+    BindDecl(BinderId),
     /// The explicit captures' binders become visible.
     Captures(List<Capture>),
+    /// A closure's self binder becomes visible.
+    SelfBinder(BinderId),
     /// A loop or block label becomes visible.
     Label(BinderId),
     Loop {
@@ -88,10 +100,20 @@ pub(crate) enum Mark {
         is_loop: bool,
     },
     PopLoop,
+    /// The innermost loop's `step` begins and ends.
+    StepBegin,
+    StepEnd,
     Try,
     PopTry,
+    /// A `defer` body: no jump may leave it, no `yield` inside.
     Defer,
     PopDefer,
+    /// A `finally` body: jumps may leave it (overriding the pending
+    /// completion), no `yield` inside.
+    Finally,
+    PopFinally,
+    /// The next node is a path in this namespace.
+    ExpectNs(Ns),
     Open(Group),
     Close,
 }
@@ -99,8 +121,7 @@ pub(crate) enum Mark {
 /// Pushes children and marks of `node`, in canonical order, onto `out`.
 ///
 /// The node's own `Enter`/`Leave` are not included. Ids that do not resolve in
-/// `store` contribute nothing (only the validator ever sees such a store, and it
-/// checks ranges before it traverses).
+/// `store` contribute nothing (the validator checks ranges before it walks).
 pub(crate) fn expand(store: &Store, node: NodeRef, out: &mut Vec<Step>) {
     let mut e = Expander { s: store, out };
     match node {
@@ -111,11 +132,16 @@ pub(crate) fn expand(store: &Store, node: NodeRef, out: &mut Vec<Step>) {
         NodeRef::Ty(id) => e.ty(id),
         NodeRef::Path(id) => {
             if let Some(path) = store.path(id) {
+                if let Some(q) = path.qself {
+                    e.open(Group::Tag("qself"));
+                    e.ty_node(q.ty);
+                    e.close();
+                }
                 for (i, seg) in store.list(path.segments).iter().enumerate() {
                     if !seg.args.is_empty() {
                         let i = u32::try_from(i).unwrap_or(u32::MAX);
                         e.open(Group::SegmentArgs(i));
-                        e.tys(seg.args);
+                        e.generic_args(seg.args);
                         e.close();
                     }
                 }
@@ -148,9 +174,11 @@ pub(crate) fn expand(store: &Store, node: NodeRef, out: &mut Vec<Step>) {
                 e.node(NodeRef::Pat(param.pat));
                 e.opt_ty(param.ty);
                 if let Some(d) = param.default {
+                    e.mark(Mark::Frame(FrameOf::Default(id)));
                     e.tagged_expr("default", d);
+                    e.mark(Mark::PopFrame);
                 }
-                e.mark(Mark::Bind(BindSite::Param));
+                e.mark(Mark::Bind(BindSite::Param, param.pat));
             }
         }
     }
@@ -180,6 +208,11 @@ impl Expander<'_> {
     #[inline]
     fn close(&mut self) {
         self.mark(Mark::Close);
+    }
+
+    fn path(&mut self, id: crate::id::PathId, ns: Ns) {
+        self.mark(Mark::ExpectNs(ns));
+        self.node(NodeRef::Path(id));
     }
 
     fn expr_node(&mut self, id: ExprId) {
@@ -234,33 +267,71 @@ impl Expander<'_> {
         }
     }
 
+    fn bound(&mut self, b: Bound) {
+        match b {
+            Bound::Ty(t) => self.ty_node(t),
+            Bound::Region(p) => self.path(p, Ns::Region),
+        }
+    }
+
+    fn bounds(&mut self, list: List<Bound>) {
+        for b in self.s.list(list) {
+            self.bound(*b);
+        }
+    }
+
+    fn generic_arg(&mut self, arg: GenericArg) {
+        match arg {
+            GenericArg::Ty(t) => self.ty_node(t),
+            GenericArg::Const(e) => {
+                self.open(Group::Tag("const"));
+                self.mark(Mark::Frame(FrameOf::Const { integer: true }));
+                self.expr_node(e);
+                self.mark(Mark::PopFrame);
+                self.close();
+            }
+            GenericArg::Region(p) => self.path(p, Ns::Region),
+            GenericArg::Binding { name, ty } => {
+                self.open(Group::Binding(name));
+                self.ty_node(ty);
+                self.close();
+            }
+            GenericArg::Constraint { name, bounds } => {
+                self.open(Group::Constraint(name));
+                self.bounds(bounds);
+                self.close();
+            }
+        }
+    }
+
+    fn generic_args(&mut self, list: List<GenericArg>) {
+        for a in self.s.list(list) {
+            self.generic_arg(*a);
+        }
+    }
+
     fn generics(&mut self, g: &Generics) {
         self.mark(Mark::Generics(g.params));
         for gp in self.s.list(g.params) {
-            self.out
-                .push(Step::Mark(Mark::Open(Group::Generic(gp.binder))));
-            for t in self.s.list(gp.bounds) {
-                self.out.push(Step::Enter(NodeRef::Ty(*t)));
-            }
+            self.open(Group::Generic(gp.binder));
+            self.bounds(gp.bounds);
             if let Some(t) = gp.ty {
-                self.out.push(Step::Mark(Mark::Open(Group::Tag("type"))));
-                self.out.push(Step::Enter(NodeRef::Ty(t)));
-                self.out.push(Step::Mark(Mark::Close));
+                self.open(Group::Tag("type"));
+                self.ty_node(t);
+                self.close();
             }
-            if let Some(t) = gp.default {
-                self.out.push(Step::Mark(Mark::Open(Group::Tag("default"))));
-                self.out.push(Step::Enter(NodeRef::Ty(t)));
-                self.out.push(Step::Mark(Mark::Close));
+            if let Some(d) = gp.default {
+                self.open(Group::Tag("default"));
+                self.generic_arg(d);
+                self.close();
             }
-            self.out.push(Step::Mark(Mark::Close));
+            self.close();
         }
         for wp in self.s.list(g.preds) {
-            self.out.push(Step::Mark(Mark::Open(Group::Where)));
-            self.out.push(Step::Enter(NodeRef::Ty(wp.ty)));
-            for t in self.s.list(wp.bounds) {
-                self.out.push(Step::Enter(NodeRef::Ty(*t)));
-            }
-            self.out.push(Step::Mark(Mark::Close));
+            self.open(Group::Where);
+            self.bound(wp.subject);
+            self.bounds(wp.bounds);
+            self.close();
         }
     }
 
@@ -292,7 +363,11 @@ impl Expander<'_> {
             }
             ItemKind::Class(c) => {
                 self.generics(&c.generics);
-                self.tagged_ty("base", c.base);
+                if !c.bases.is_empty() {
+                    self.open(Group::Tag("bases"));
+                    self.tys(c.bases);
+                    self.close();
+                }
                 if !c.interfaces.is_empty() {
                     self.open(Group::Tag("implements"));
                     self.tys(c.interfaces);
@@ -319,7 +394,7 @@ impl Expander<'_> {
                 self.ty_node(*ty);
             }
             ItemKind::AssocType { bounds, default } => {
-                self.tys(*bounds);
+                self.bounds(*bounds);
                 self.tagged_ty("default", *default);
             }
             ItemKind::Const { ty, value } => {
@@ -330,8 +405,27 @@ impl Expander<'_> {
                 self.opt_ty(*ty);
                 self.opt_expr(*init);
             }
-            ItemKind::Module { items } => self.items(*items),
-            ItemKind::Import { path, .. } => self.node(NodeRef::Path(*path)),
+            ItemKind::Module { items, body, .. } => {
+                self.items(*items);
+                self.opt_expr(*body);
+            }
+            ItemKind::Import { path, .. } => self.path(*path, Ns::Import),
+            ItemKind::MixinUse(m) => {
+                self.tys(m.mixins);
+                for rule in self.s.list(m.rules) {
+                    self.out
+                        .push(Step::Mark(Mark::Open(Group::MixinRule(*rule))));
+                    if let Some(from) = rule.from {
+                        self.out.push(Step::Enter(NodeRef::Ty(from)));
+                    }
+                    if let crate::item::MixinAction::Insteadof(others) = rule.action {
+                        for t in self.s.list(others) {
+                            self.out.push(Step::Enter(NodeRef::Ty(*t)));
+                        }
+                    }
+                    self.out.push(Step::Mark(Mark::Close));
+                }
+            }
             ItemKind::Err => {}
         }
         self.mark(Mark::PopScope);
@@ -343,7 +437,8 @@ impl Expander<'_> {
             self.out.push(Step::Mark(Mark::Open(group)));
             self.out.push(Step::Mark(Mark::Scope));
             self.out.push(Step::Enter(NodeRef::Pat(arm.pat)));
-            self.out.push(Step::Mark(Mark::Bind(BindSite::Arm)));
+            self.out
+                .push(Step::Mark(Mark::Bind(BindSite::Arm, arm.pat)));
             if let Some(g) = arm.guard {
                 self.out.push(Step::Mark(Mark::Open(Group::Tag("guard"))));
                 self.out.push(Step::Enter(NodeRef::Expr(g)));
@@ -355,9 +450,9 @@ impl Expander<'_> {
         }
     }
 
-    fn args(&mut self, args: List<crate::expr::Arg>) {
+    fn args(&mut self, args: List<Arg>) {
         for arg in self.s.list(args) {
-            self.out.push(Step::Mark(Mark::Open(Group::Arg(arg.kind))));
+            self.out.push(Step::Mark(Mark::Open(Group::Arg(*arg))));
             self.out.push(Step::Enter(NodeRef::Expr(arg.value)));
             self.out.push(Step::Mark(Mark::Close));
         }
@@ -375,7 +470,7 @@ impl Expander<'_> {
         let Some(expr) = self.s.expr(id) else { return };
         match *expr {
             Expr::Lit(_) | Expr::Continue { .. } | Expr::Err => {}
-            Expr::Path(p) => self.node(NodeRef::Path(p)),
+            Expr::Path(p) => self.path(p, Ns::Value),
             Expr::Tuple(xs) | Expr::Array(xs) => self.exprs(xs),
             Expr::Repeat { elem, count } => {
                 self.expr_node(elem);
@@ -383,7 +478,7 @@ impl Expander<'_> {
             }
             Expr::Record { path, fields, base } => {
                 if let Some(p) = path {
-                    self.node(NodeRef::Path(p));
+                    self.path(p, Ns::Type);
                 }
                 for fi in self.s.list(fields) {
                     self.out
@@ -416,10 +511,23 @@ impl Expander<'_> {
                 ..
             } => {
                 self.expr_node(receiver);
-                self.tys(generic_args);
+                self.generic_args(generic_args);
+                self.args(args);
+            }
+            Expr::DynMethodCall {
+                receiver,
+                name,
+                args,
+            } => {
+                self.expr_node(receiver);
+                self.tagged_expr("name", name);
                 self.args(args);
             }
             Expr::Field { base, .. } => self.expr_node(base),
+            Expr::DynField { base, name } => {
+                self.expr_node(base);
+                self.tagged_expr("name", name);
+            }
             Expr::Index { base, index } => {
                 self.expr_node(base);
                 self.expr_node(index);
@@ -433,11 +541,17 @@ impl Expander<'_> {
                 self.expr_node(target);
                 self.expr_node(value);
             }
+            Expr::RefAssign { target, source } => {
+                self.expr_node(target);
+                self.expr_node(source);
+            }
             Expr::Deref(x)
             | Expr::Borrow { expr: x, .. }
             | Expr::Throw(x)
             | Expr::Await(x)
-            | Expr::Spawn(x) => self.expr_node(x),
+            | Expr::Spawn(x)
+            | Expr::VarVar(x)
+            | Expr::Append(x) => self.expr_node(x),
             Expr::Block(block) => {
                 self.label_scope(block.label, false);
                 for st in self.s.list(block.stmts) {
@@ -460,7 +574,11 @@ impl Expander<'_> {
                 self.label_scope(label, true);
                 self.expr_node(body);
                 if let Some(s) = step {
-                    self.tagged_expr("step", s);
+                    self.open(Group::Tag("step"));
+                    self.mark(Mark::StepBegin);
+                    self.expr_node(s);
+                    self.mark(Mark::StepEnd);
+                    self.close();
                 }
                 self.mark(Mark::PopLoop);
                 self.mark(Mark::PopScope);
@@ -471,11 +589,15 @@ impl Expander<'_> {
             Expr::Closure(c) => {
                 for cap in self.s.list(c.captures) {
                     self.out.push(Step::Mark(Mark::Open(Group::Capture(*cap))));
+                    self.out.push(Step::Mark(Mark::ExpectNs(Ns::Value)));
                     self.out.push(Step::Enter(NodeRef::Path(cap.outer)));
                     self.out.push(Step::Mark(Mark::Close));
                 }
                 self.mark(Mark::Frame(FrameOf::Closure(id)));
                 self.mark(Mark::Scope);
+                if let Some(me) = c.self_binder {
+                    self.mark(Mark::SelfBinder(me));
+                }
                 self.mark(Mark::Captures(c.captures));
                 for p in self.s.list(c.params) {
                     self.out.push(Step::Enter(NodeRef::Param(*p)));
@@ -496,16 +618,30 @@ impl Expander<'_> {
                 self.arms(catches, Group::Catch);
                 if let Some(f) = finally {
                     self.open(Group::Tag("finally"));
-                    self.mark(Mark::Defer);
+                    self.mark(Mark::Finally);
                     self.expr_node(f);
-                    self.mark(Mark::PopDefer);
+                    self.mark(Mark::PopFinally);
                     self.close();
                 }
+            }
+            Expr::Asm(asm) => {
+                for op in self.s.list(asm.operands) {
+                    self.out
+                        .push(Step::Mark(Mark::Open(Group::AsmOperand(*op))));
+                    self.out.push(Step::Enter(NodeRef::Expr(op.expr)));
+                    self.out.push(Step::Mark(Mark::Close));
+                }
+            }
+            Expr::Intrinsic {
+                generic_args, args, ..
+            } => {
+                self.generic_args(generic_args);
+                self.exprs(args);
             }
         }
     }
 
-    fn stmt(&mut self, id: crate::id::StmtId) {
+    fn stmt(&mut self, id: StmtId) {
         let Some(stmt) = self.s.stmt(id) else { return };
         match *stmt {
             Stmt::Let {
@@ -520,7 +656,7 @@ impl Expander<'_> {
                 if let Some(e) = else_ {
                     self.tagged_expr("else", e);
                 }
-                self.mark(Mark::Bind(BindSite::Let));
+                self.mark(Mark::Bind(BindSite::Let, pat));
             }
             Stmt::Expr(e) => self.expr_node(e),
             Stmt::Item(i) => self.node(NodeRef::Item(i)),
@@ -529,33 +665,55 @@ impl Expander<'_> {
                 self.expr_node(e);
                 self.mark(Mark::PopDefer);
             }
+            Stmt::Static { binder, ty, init } => {
+                self.opt_ty(ty);
+                self.opt_expr(init);
+                self.mark(Mark::BindDecl(binder));
+            }
+            Stmt::Global { binder, path } => {
+                self.path(path, Ns::Value);
+                self.mark(Mark::BindDecl(binder));
+            }
             Stmt::Err => {}
         }
     }
 
-    fn pats(&mut self, list: List<crate::id::PatId>) {
+    fn pats(&mut self, list: List<PatId>) {
         for p in self.s.list(list) {
             self.out.push(Step::Enter(NodeRef::Pat(*p)));
         }
     }
 
-    fn pat(&mut self, id: crate::id::PatId) {
+    fn pat(&mut self, id: PatId) {
         let Some(pat) = self.s.pat(id) else { return };
         match *pat {
-            Pat::Wild | Pat::Lit(_) | Pat::Range { .. } | Pat::Err => {}
+            Pat::Wild | Pat::Lit(_) | Pat::Err => {}
             Pat::Bind { sub, .. } => {
                 if let Some(s) = sub {
                     self.node(NodeRef::Pat(s));
                 }
             }
+            Pat::Ident { path, .. } => self.path(path, Ns::Pattern),
+            Pat::Range { lo, hi, .. } => {
+                if let Some(lo) = lo {
+                    self.open(Group::Tag("lo"));
+                    self.node(NodeRef::Pat(lo));
+                    self.close();
+                }
+                if let Some(hi) = hi {
+                    self.open(Group::Tag("hi"));
+                    self.node(NodeRef::Pat(hi));
+                    self.close();
+                }
+            }
             Pat::Tuple { elems, .. } | Pat::Or(elems) => self.pats(elems),
             Pat::Ctor { path, elems, .. } => {
-                self.node(NodeRef::Path(path));
+                self.path(path, Ns::Pattern);
                 self.pats(elems);
             }
             Pat::Record { path, fields, .. } => {
                 if let Some(p) = path {
-                    self.node(NodeRef::Path(p));
+                    self.path(p, Ns::Type);
                 }
                 for fp in self.s.list(fields) {
                     self.out
@@ -564,7 +722,7 @@ impl Expander<'_> {
                     self.out.push(Step::Mark(Mark::Close));
                 }
             }
-            Pat::Path(p) => self.node(NodeRef::Path(p)),
+            Pat::Path(p) => self.path(p, Ns::Pattern),
             Pat::Slice { prefix, rest } => {
                 self.pats(prefix);
                 if let Some(rest) = rest {
@@ -592,8 +750,9 @@ impl Expander<'_> {
         let Some(ty) = self.s.ty(id) else { return };
         match *ty {
             Ty::Infer | Ty::Prim(_) | Ty::Any | Ty::Never | Ty::SelfTy | Ty::Err => {}
-            Ty::Path(p) => self.node(NodeRef::Path(p)),
-            Ty::Tuple(ts) | Ty::Object(ts) => self.tys(ts),
+            Ty::Path(p) => self.path(p, Ns::Type),
+            Ty::Tuple(ts) => self.tys(ts),
+            Ty::Object(bs) | Ty::Impl(bs) => self.bounds(bs),
             Ty::Array { elem, len } => {
                 self.ty_node(elem);
                 self.mark(Mark::Frame(FrameOf::Const { integer: true }));
@@ -603,7 +762,7 @@ impl Expander<'_> {
             Ty::Slice(t) | Ty::Ptr { inner: t, .. } | Ty::Nullable(t) => self.ty_node(t),
             Ty::Ref { region, inner, .. } => {
                 if let Some(r) = region {
-                    self.node(NodeRef::Path(r));
+                    self.path(r, Ns::Region);
                 }
                 self.ty_node(inner);
             }
@@ -617,16 +776,41 @@ impl Expander<'_> {
                 self.tagged_ty("ret", Some(ret));
                 self.tagged_ty("throws", throws);
             }
-            Ty::Const(e) => {
-                self.mark(Mark::Frame(FrameOf::Const { integer: true }));
-                self.expr_node(e);
-                self.mark(Mark::PopFrame);
-            }
         }
     }
 }
 
+/// The kind of a frame, as delivered by [`Event::FrameOpen`].
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{Frame, ItemId};
+///
+/// let f = Frame::Item(ItemId::from_index(0).unwrap());
+/// assert!(matches!(f, Frame::Item(_)));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Frame {
+    /// An item (its generics, parameters, body).
+    Item(ItemId),
+    /// A closure.
+    Closure(ExprId),
+    /// A parameter's default expression.
+    Default(ParamId),
+    /// A constant context (array length, const argument, discriminant, field
+    /// default).
+    Const,
+}
+
 /// An event of [`Hir::walk_from`](crate::Hir::walk_from).
+///
+/// Besides entering and leaving nodes, the walk reports the scoping structure
+/// the validator uses, so a resolver never re-derives the scope rules: a
+/// `Bind(b)` arrives exactly where `b` becomes visible, and `b` stays visible
+/// until the `ScopeClose` matching the innermost `ScopeOpen` around it.
+/// Frames bracket items, closures, parameter defaults, and constant contexts.
 ///
 /// # Examples
 ///
@@ -634,18 +818,31 @@ impl Expander<'_> {
 /// use hir_lang::{Event, ItemId, NodeRef};
 ///
 /// let root = NodeRef::Item(ItemId::from_index(0).unwrap());
-/// assert_eq!(Event::Enter(root).node(), root);
+/// assert_eq!(Event::Enter(root).node(), Some(root));
+/// assert_eq!(Event::ScopeOpen.node(), None);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Event {
     /// The walk reached a node; its children follow.
     Enter(NodeRef),
     /// All of the node's children have been walked.
     Leave(NodeRef),
+    /// A scope begins.
+    ScopeOpen,
+    /// The innermost open scope ends; binders bound in it are no longer
+    /// visible.
+    ScopeClose,
+    /// A binder becomes visible here.
+    Bind(BinderId),
+    /// A frame begins.
+    FrameOpen(Frame),
+    /// The innermost frame ends.
+    FrameClose,
 }
 
 impl Event {
-    /// Returns the node the event is about.
+    /// Returns the node an `Enter` or `Leave` is about.
     ///
     /// # Examples
     ///
@@ -653,12 +850,13 @@ impl Event {
     /// use hir_lang::{Event, ExprId, NodeRef};
     ///
     /// let n = NodeRef::Expr(ExprId::from_index(2).unwrap());
-    /// assert_eq!(Event::Leave(n).node(), n);
+    /// assert_eq!(Event::Leave(n).node(), Some(n));
     /// ```
     #[must_use]
-    pub const fn node(self) -> NodeRef {
+    pub const fn node(self) -> Option<NodeRef> {
         match self {
-            Self::Enter(n) | Self::Leave(n) => n,
+            Self::Enter(n) | Self::Leave(n) => Some(n),
+            _ => None,
         }
     }
 }
@@ -683,6 +881,44 @@ pub enum Control {
     Stop,
 }
 
+/// Appends the binders a root pattern binds, in first-occurrence order, each
+/// once (or-pattern alternatives repeat them).
+pub(crate) fn pattern_binders(store: &Store, root: PatId, out: &mut Vec<BinderId>) {
+    let mut seen: BTreeSet<BinderId> = BTreeSet::new();
+    let mut add = |b: BinderId, out: &mut Vec<BinderId>| {
+        if seen.insert(b) {
+            out.push(b);
+        }
+    };
+    let mut stack = alloc::vec![root];
+    while let Some(p) = stack.pop() {
+        let Some(pat) = store.pat(p) else { continue };
+        match *pat {
+            Pat::Bind { binder, sub, .. } => {
+                add(binder, out);
+                stack.extend(sub);
+            }
+            Pat::Ident { binder, .. } => add(binder, out),
+            Pat::Tuple { elems, .. } | Pat::Ctor { elems, .. } | Pat::Or(elems) => {
+                stack.extend(store.list(elems).iter().rev());
+            }
+            Pat::Record { fields, .. } => {
+                stack.extend(store.list(fields).iter().rev().map(|f| f.pat));
+            }
+            Pat::Slice { prefix, rest } => {
+                if let Some(rest) = rest {
+                    stack.extend(store.list(rest.suffix).iter().rev());
+                    stack.extend(rest.bind);
+                }
+                stack.extend(store.list(prefix).iter().rev());
+            }
+            Pat::Ref { inner, .. } => stack.push(inner),
+            Pat::TypeTest { pat, .. } => stack.extend(pat),
+            Pat::Wild | Pat::Lit(_) | Pat::Range { .. } | Pat::Path(_) | Pat::Err => {}
+        }
+    }
+}
+
 /// Walks the subtree of `start` in canonical order with an explicit stack.
 pub(crate) fn walk_store<F>(store: &Store, start: NodeRef, mut f: F)
 where
@@ -690,26 +926,86 @@ where
 {
     let mut stack: Vec<Step> = Vec::new();
     let mut scratch: Vec<Step> = Vec::new();
+    let mut binders: Vec<BinderId> = Vec::new();
     stack.push(Step::Enter(start));
     while let Some(step) = stack.pop() {
-        match step {
-            Step::Enter(node) => match f(Event::Enter(node)) {
-                Control::Stop => return,
-                Control::Skip => stack.push(Step::Leave(node)),
-                Control::Continue => {
-                    stack.push(Step::Leave(node));
-                    scratch.clear();
-                    expand(store, node, &mut scratch);
-                    stack.extend(scratch.drain(..).rev());
+        let event = match step {
+            Step::Enter(node) => {
+                match f(Event::Enter(node)) {
+                    Control::Stop => return,
+                    Control::Skip => stack.push(Step::Leave(node)),
+                    Control::Continue => {
+                        stack.push(Step::Leave(node));
+                        scratch.clear();
+                        expand(store, node, &mut scratch);
+                        stack.extend(scratch.drain(..).rev());
+                    }
                 }
-            },
-            Step::Leave(node) => {
-                if f(Event::Leave(node)) == Control::Stop {
-                    return;
+                continue;
+            }
+            Step::Leave(node) => Event::Leave(node),
+            Step::Mark(mark) => {
+                binders.clear();
+                let event = match mark {
+                    Mark::Scope => Some(Event::ScopeOpen),
+                    Mark::PopScope => Some(Event::ScopeClose),
+                    Mark::PopFrame => Some(Event::FrameClose),
+                    Mark::Frame(of) => Some(Event::FrameOpen(match of {
+                        FrameOf::Item(i) => Frame::Item(i),
+                        FrameOf::Closure(c) => Frame::Closure(c),
+                        FrameOf::Default(p) => Frame::Default(p),
+                        FrameOf::Const { .. } => Frame::Const,
+                    })),
+                    Mark::Generics(list) => {
+                        binders.extend(store.list(list).iter().map(|g| g.binder));
+                        None
+                    }
+                    Mark::Bind(_, pat) => {
+                        pattern_binders(store, pat, &mut binders);
+                        None
+                    }
+                    Mark::Captures(list) => {
+                        binders.extend(store.list(list).iter().map(|c| c.binder));
+                        None
+                    }
+                    Mark::BindDecl(b) | Mark::SelfBinder(b) | Mark::Label(b) => {
+                        binders.push(b);
+                        None
+                    }
+                    _ => None,
+                };
+                for b in &binders {
+                    if f(Event::Bind(*b)) == Control::Stop {
+                        return;
+                    }
+                }
+                match event {
+                    Some(e) => e,
+                    None => continue,
                 }
             }
-            Step::Mark(_) => {}
+        };
+        if f(event) == Control::Stop {
+            return;
         }
+    }
+}
+
+/// Calls `f` on every node of the subtree of `start` in canonical preorder.
+/// The node-only fast path behind the Tier-1 [`walk`](crate::walk): no
+/// leave, scope, binder, or frame events are produced.
+pub(crate) fn walk_nodes<F: FnMut(NodeRef)>(store: &Store, start: NodeRef, mut f: F) {
+    let mut stack: Vec<NodeRef> = Vec::new();
+    let mut scratch: Vec<Step> = Vec::new();
+    stack.push(start);
+    while let Some(node) = stack.pop() {
+        f(node);
+        scratch.clear();
+        expand(store, node, &mut scratch);
+        stack.extend(scratch.iter().rev().filter_map(|step| match step {
+            Step::Enter(child) => Some(*child),
+            _ => None,
+        }));
     }
 }
 
@@ -721,4 +1017,9 @@ pub(crate) fn children_store(store: &Store, node: NodeRef, out: &mut Vec<NodeRef
         Step::Enter(n) => Some(n),
         _ => None,
     }));
+}
+
+/// Returns `true` for the arg kinds that may carry `place`.
+pub(crate) const fn place_arg_ok(kind: ArgKind) -> bool {
+    matches!(kind, ArgKind::Positional | ArgKind::Named(_))
 }

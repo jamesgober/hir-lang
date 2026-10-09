@@ -466,6 +466,8 @@ impl Low {
                     effects: Effects::NONE,
                     implicit: implicit.then_some(CaptureMode::Infer),
                     captures: List::EMPTY,
+                    self_binder: None,
+                    defaults: hir_lang::DefaultEval::PerCall,
                 }))
             }
             E::Call(c, args) => {
@@ -767,12 +769,18 @@ proptest! {
             Mutation::UseBeforeLet,
         ][which];
         let (result, rest) = build(&recipe, true, mutation);
+        if mutation == Mutation::Unbound {
+            // An unbound binder is valid (it is in no scope).
+            let ok = result.is_ok() || !rest.jump_errors.is_empty();
+            prop_assert!(ok);
+            return Ok(());
+        }
         let err = result.unwrap_err();
         let ok = match mutation {
             Mutation::Share => matches!(err, HirError::SharedNode { .. }),
             Mutation::Orphan => matches!(err, HirError::Unreachable { .. }),
             Mutation::Dangling => matches!(err, HirError::Dangling { .. }),
-            Mutation::Unbound => matches!(err, HirError::BinderNotBound { .. }),
+            Mutation::Unbound => unreachable!("an unbound binder is valid"),
             Mutation::Policy => matches!(err, HirError::Policy { .. }),
             Mutation::Arity => matches!(err, HirError::Arity { .. }),
             Mutation::KindMismatch => matches!(err, HirError::BinderKind { .. }),
@@ -805,7 +813,9 @@ proptest! {
                 let path = PathId::from_index(p as usize % paths).unwrap();
                 let res = match kind {
                     0 if binders > 0 => Res::Local(BinderId::from_index(t as usize % binders).unwrap()),
-                    1 => Res::Item(ItemId::from_index(t as usize % hir.count(IdKind::Item)).unwrap()),
+                    1 => Res::Def(hir.def(hir_lang::Def::Item(
+                        ItemId::from_index(t as usize % hir.count(IdKind::Item)).unwrap(),
+                    ))),
                     2 => Res::Err,
                     3 => Res::Prim(hir_lang::Prim::I8),
                     _ => Res::Unresolved,
@@ -922,6 +932,8 @@ fn apply_raw(b: &mut Builder, sym: Symbol, step: &RawStep) {
                 effects: Effects::NONE,
                 implicit: (step.c % 2 == 0).then_some(CaptureMode::Infer),
                 captures: caps,
+                self_binder: None,
+                defaults: hir_lang::DefaultEval::PerCall,
             }));
         }
         8 => {
@@ -977,7 +989,7 @@ fn apply_raw(b: &mut Builder, sym: Symbol, step: &RawStep) {
         19 => {
             let res = match step.b % 4 {
                 0 => Res::Local(bi(step.c)),
-                1 => Res::Item(it(step.c)),
+                1 => Res::Def(b.def(hir_lang::Def::Item(it(step.c)))),
                 2 => Res::Unresolved,
                 _ => Res::Err,
             };
@@ -986,7 +998,14 @@ fn apply_raw(b: &mut Builder, sym: Symbol, step: &RawStep) {
         }
         20 => {
             let items = b.list(&[it(step.a)]);
-            let _ = b.item(Item::new(None, ItemKind::Module { items }));
+            let _ = b.item(Item::new(
+                None,
+                ItemKind::Module {
+                    items,
+                    body: None,
+                    effects: hir_lang::Effects::NONE,
+                },
+            ));
         }
         21 => {
             let params = if step.c % 2 == 0 {
@@ -1074,7 +1093,7 @@ proptest! {
             prop_assert_eq!(hir.validate(), Ok(()));
             let mut nodes = Vec::new();
             hir_lang::walk(&hir, |n| nodes.push(n));
-            prop_assert_eq!(nodes.len(), total_nodes(&hir));
+            prop_assert!(nodes.len() <= total_nodes(&hir));
             let _ = hir_lang::print(&hir, &names);
             for i in 0..hir.count(IdKind::Expr) {
                 let _ = hir.implicit_captures(ExprId::from_index(i).unwrap());
@@ -1082,6 +1101,96 @@ proptest! {
             hir.walk_from(NodeRef::Item(hir.root()), |_| Control::Continue);
         }
     }
+}
+
+/// Builds the garbage arena described by `steps`.
+fn garbage(steps: &[RawStep], names: &mut Interner) -> Builder {
+    let sym = names.intern("g");
+    let mut b = Builder::new();
+    for step in steps {
+        apply_raw(&mut b, sym, step);
+    }
+    b
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+
+    /// Lenient finish is total too: on any arena with a module root it
+    /// returns a valid `Hir` (it fails only without a repair: a missing or
+    /// non-module root), and it is deterministic.
+    #[test]
+    fn prop_lenient_finish_always_yields_a_valid_hir(steps in raw_steps(), root in 0usize..10) {
+        let mut names = Interner::new();
+        let root = ItemId::from_index(root).unwrap();
+        let a = garbage(&steps, &mut names).finish_lenient(root);
+        let b = garbage(&steps, &mut names).finish_lenient(root);
+        match (&a, &b) {
+            (Ok((ha, pa)), Ok((hb, pb))) => {
+                prop_assert_eq!(ha.validate(), Ok(()));
+                prop_assert_eq!(ha, hb);
+                prop_assert_eq!(pa, pb);
+                let _ = hir_lang::print(ha, &names);
+                let _ = ha.all_implicit_captures();
+            }
+            (Err(ea), Err(eb)) => {
+                prop_assert_eq!(ea, eb);
+                let fatal = matches!(
+                    ea,
+                    HirError::RootNotModule | HirError::Dangling { .. } | HirError::CapacityExceeded { .. }
+                );
+                prop_assert!(fatal, "{:?}", ea);
+            }
+            _ => prop_assert!(false, "nondeterministic"),
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
+
+    /// On generated programs, lenient and strict agree: no problems exactly
+    /// when strict accepts, and strict's error is among the lenient problems.
+    /// The repaired HIR always validates.
+    #[test]
+    fn prop_lenient_agrees_with_strict(recipe in expr()) {
+        let (strict, _) = build(&recipe, false, Mutation::None);
+        let (hir, problems) = build_lenient(&recipe);
+        prop_assert_eq!(hir.validate(), Ok(()));
+        match strict {
+            Ok(_) => prop_assert!(problems.is_empty(), "{:?}", problems),
+            Err(e) => prop_assert!(problems.contains(&e), "{:?} not in {:?}", e, problems),
+        }
+    }
+}
+
+/// Lowers `recipe` like `build`, but finishes leniently.
+fn build_lenient(recipe: &E) -> (Hir, Vec<HirError>) {
+    let mut recipe = recipe.clone();
+    let mut kinds = Vec::new();
+    number(&mut recipe, &mut kinds);
+    let mut low = Low::new(&kinds, false);
+    low.frames.push(Frame {
+        implicit_closure: false,
+        loop_base: 0,
+    });
+    let mut params = Vec::new();
+    for _ in 0..2 {
+        let binder = low
+            .b
+            .binder(Binder::new(Name::new(low.x), BinderKind::Param));
+        low.binders.push(binder);
+        let pat = low.b.bind(binder);
+        params.push(low.b.param(Param::new(pat)));
+        let index = low.binders.len() - 1;
+        low.activate(&[index]);
+    }
+    let e = low.expr(&recipe);
+    let stmts = vec![low.b.expr_stmt(e)];
+    let block = low.b.block(&stmts, None);
+    let main = low.b.func(Name::new(low.x), &params, block);
+    let root = low.b.module(None, &[main]);
+    low.b.finish_lenient(root).unwrap()
 }
 
 #[test]

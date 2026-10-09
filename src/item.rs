@@ -4,10 +4,11 @@ use intern_lang::Symbol;
 use span_lang::Span;
 
 use crate::{
+    expr::DefaultEval,
     id::{BinderId, ExprId, FieldId, ItemId, List, ParamId, PatId, PathId, TyId, VariantId},
     lit::Lit,
     origin::{Ident, Name},
-    ty::Effects,
+    ty::{Bound, Effects, GenericArg},
 };
 
 /// Visibility of an item or field.
@@ -24,6 +25,8 @@ pub enum Vis {
     /// Visible in the declaring module (and, by language rule, its children).
     #[default]
     Private,
+    /// Visible in the declaring class and its subclasses.
+    Protected,
     /// Visible in the declaring package/crate.
     Package,
     /// Visible everywhere.
@@ -51,12 +54,12 @@ pub enum Vis {
 pub struct GenericParam {
     /// The parameter's binder.
     pub binder: BinderId,
-    /// Interface bounds.
-    pub bounds: List<TyId>,
+    /// Interface and region bounds.
+    pub bounds: List<Bound>,
     /// The type of a constant parameter.
     pub ty: Option<TyId>,
-    /// The default (a `Ty::Const` for a constant parameter).
-    pub default: Option<TyId>,
+    /// The default: a type, or `GenericArg::Const` for a constant parameter.
+    pub default: Option<GenericArg>,
 }
 
 impl GenericParam {
@@ -84,24 +87,24 @@ impl GenericParam {
     }
 }
 
-/// A `where` predicate: `ty: bounds`.
+/// A `where` predicate: `T: A + 'r` or `'a: 'b`.
 ///
 /// # Examples
 ///
 /// ```
-/// use hir_lang::{Builder, List, Ty, WherePred};
+/// use hir_lang::{Bound, Builder, List, Ty, WherePred};
 ///
 /// let mut b = Builder::new();
 /// let ty = b.ty(Ty::SelfTy);
-/// let pred = WherePred { ty, bounds: List::EMPTY };
-/// assert_eq!(pred.ty, ty);
+/// let pred = WherePred { subject: Bound::Ty(ty), bounds: List::EMPTY };
+/// assert_eq!(pred.subject, Bound::Ty(ty));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WherePred {
-    /// The constrained type.
-    pub ty: TyId,
-    /// Its interface bounds.
-    pub bounds: List<TyId>,
+    /// The constrained type or region.
+    pub subject: Bound,
+    /// Its bounds.
+    pub bounds: List<Bound>,
 }
 
 /// The generic parameters and predicates of an item.
@@ -172,6 +175,9 @@ pub struct Param {
     pub default: Option<ExprId>,
     /// How the argument is received.
     pub kind: ParamKind,
+    /// The parameter aliases the caller's place (PHP `&$x`); the matching
+    /// argument should be a place (`Arg::place`).
+    pub by_ref: bool,
 }
 
 impl Param {
@@ -193,6 +199,7 @@ impl Param {
             ty: None,
             default: None,
             kind: ParamKind::Normal,
+            by_ref: false,
         }
     }
 }
@@ -321,6 +328,8 @@ pub struct FnDef {
     pub abi: Option<Symbol>,
     /// The body; absent for required, abstract, and foreign functions.
     pub body: Option<ExprId>,
+    /// When parameter defaults are evaluated.
+    pub defaults: DefaultEval,
 }
 
 /// A record (struct).
@@ -340,6 +349,8 @@ pub struct RecordDef {
     pub shape: Shape,
     /// The fields.
     pub fields: List<FieldId>,
+    /// An untagged union: the fields overlap (Zero, Kraken); shape `Named`.
+    pub is_union: bool,
 }
 
 /// A sum (enum, tagged union).
@@ -359,7 +370,8 @@ pub struct SumDef {
     pub variants: List<VariantId>,
 }
 
-/// A class: fields, single inheritance, interfaces, and members.
+/// A class: fields, base classes, interfaces, and members. Also a PHP trait
+/// (`mixin`), whose members are copied into the classes that use it.
 ///
 /// # Examples
 ///
@@ -367,24 +379,93 @@ pub struct SumDef {
 /// use hir_lang::ClassDef;
 ///
 /// let class = ClassDef::default();
-/// assert!(class.base.is_none() && !class.is_abstract);
+/// assert!(class.bases.is_empty() && !class.is_abstract);
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ClassDef {
     /// Generic parameters.
     pub generics: Generics,
-    /// The base class.
-    pub base: Option<TyId>,
+    /// Base classes (one for PHP, several for Python), in resolution order.
+    pub bases: List<TyId>,
     /// Implemented interfaces.
     pub interfaces: List<TyId>,
     /// Instance fields (named, unique).
     pub fields: List<FieldId>,
-    /// Members: `Fn`, `Const`, `Global` (statics), `Alias`.
+    /// Members: `Fn`, `Const`, `Global` (statics), `Alias`, `MixinUse`.
     pub items: List<ItemId>,
     /// Cannot be instantiated; may declare abstract methods.
     pub is_abstract: bool,
     /// Cannot be extended.
     pub is_final: bool,
+    /// A PHP trait: a mixin of members, used by classes, never instantiated.
+    pub mixin: bool,
+}
+
+/// What a mixin rule does with a method.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{List, MixinAction};
+///
+/// assert!(matches!(MixinAction::Insteadof(List::EMPTY), MixinAction::Insteadof(_)));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MixinAction {
+    /// `A::m insteadof B, C`: take `m` from this mixin, not from those.
+    Insteadof(List<TyId>),
+    /// `A::m as protected n`: also expose `m` under a new name and/or
+    /// visibility.
+    Alias {
+        /// The new name.
+        name: Option<Ident>,
+        /// The new visibility.
+        vis: Option<Vis>,
+    },
+}
+
+/// One conflict-resolution rule of a mixin use.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{Ident, MixinAction, MixinRule, Span};
+/// use intern_lang::Interner;
+///
+/// let mut names = Interner::new();
+/// let rule = MixinRule {
+///     method: Ident::new(names.intern("hello"), Span::empty(0)),
+///     from: None,
+///     action: MixinAction::Alias { name: None, vis: None },
+/// };
+/// assert!(rule.from.is_none());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MixinRule {
+    /// The method.
+    pub method: Ident,
+    /// The mixin it comes from (`A::m`), if qualified.
+    pub from: Option<TyId>,
+    /// What to do.
+    pub action: MixinAction,
+}
+
+/// `use A, B { rules }` inside a class: copy the members of mixins (PHP
+/// traits). resolve-lang expands it after resolution.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::MixinUseDef;
+///
+/// assert!(MixinUseDef::default().mixins.is_empty());
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MixinUseDef {
+    /// The mixins (paths to `mixin` classes).
+    pub mixins: List<TyId>,
+    /// Conflict-resolution rules.
+    pub rules: List<MixinRule>,
 }
 
 /// An interface (trait).
@@ -463,7 +544,7 @@ impl ImplDef {
 /// ```
 /// use hir_lang::{ItemKind, List};
 ///
-/// let module = ItemKind::Module { items: List::EMPTY };
+/// let module = ItemKind::Module { items: List::EMPTY, body: None, effects: hir_lang::Effects::NONE };
 /// assert!(matches!(module, ItemKind::Module { .. }));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -489,8 +570,8 @@ pub enum ItemKind {
     },
     /// An associated type declared by an interface.
     AssocType {
-        /// Interface bounds.
-        bounds: List<TyId>,
+        /// Interface and region bounds.
+        bounds: List<Bound>,
         /// A default.
         default: Option<TyId>,
     },
@@ -514,7 +595,15 @@ pub enum ItemKind {
     Module {
         /// The items.
         items: List<ItemId>,
+        /// Top-level code run when the module loads (PHP and Python scripts,
+        /// NOML, REPL entries); a frame of its own that may `return`.
+        body: Option<ExprId>,
+        /// The effects the top-level code may perform (`await` at top level
+        /// needs `ASYNC`).
+        effects: Effects,
     },
+    /// A mixin use inside a class (PHP `use T;`).
+    MixinUse(MixinUseDef),
     /// An import: `use a::b`, `use a::b as c` (the item's name is the alias),
     /// `use a::*` (`glob`, no name).
     Import {
@@ -551,6 +640,7 @@ impl ItemKind {
             Self::Const { .. } => "const",
             Self::Global { .. } => "global",
             Self::Module { .. } => "module",
+            Self::MixinUse(_) => "mixin-use",
             Self::Import { .. } => "import",
             Self::Err => "error",
         }
@@ -566,7 +656,7 @@ impl ItemKind {
 /// use intern_lang::Interner;
 ///
 /// let mut names = Interner::new();
-/// let m = Item::new(Some(Name::new(names.intern("app"))), ItemKind::Module { items: List::EMPTY })
+/// let m = Item::new(Some(Name::new(names.intern("app"))), ItemKind::Module { items: List::EMPTY, body: None, effects: hir_lang::Effects::NONE })
 ///     .with_vis(Vis::Public);
 /// assert_eq!(m.vis, Vis::Public);
 /// ```

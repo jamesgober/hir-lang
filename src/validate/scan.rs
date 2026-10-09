@@ -3,93 +3,131 @@
 //! Checks every id, list, and text range against its arena or pool, every
 //! origin and mark against the expansion table, and every rule that needs only
 //! the node itself (literals, op arity and policy, shapes, duplicate member
-//! names, parameter order). After this pass every id in the store is in range,
-//! so the tree walk may index freely.
+//! names, parameter order). A node gets at most one problem (the first found);
+//! its repair is to become an error node. After this pass (and its repairs)
+//! every id in the store is in range, so the tree walk may index freely.
 
 use alloc::vec::Vec;
 
 use intern_lang::Symbol;
 
+use super::{Ctx, Repair, Sink};
 use crate::{
+    def::Def,
     error::{HirError, Malformed, Site},
-    expr::{ArgKind, CaptureMode, Expr, Stmt},
+    expr::{Arg, CaptureMode, Expr, Stmt},
     id::{
         BinderId, ExprId, FieldId, IdKind, ItemId, List, NodeRef, ParamId, PatId, PathId, StmtId,
         TextRef, TyId, VariantId,
     },
-    item::{Generics, ItemKind, ParamKind, Shape},
+    intrinsic::{AsmDir, template_ok},
+    item::{Generics, ItemKind, MixinAction, ParamKind, Shape},
     lit::Lit,
-    name::Res,
-    ops::Policy,
+    name::{PathRoot, Res},
+    ops::{OpKind, Overflow, Policy},
     origin::{ExpnId, Name, Origin},
     pat::Pat,
     store::{Pooled, Store},
-    ty::Ty,
+    ty::{Bound, GenericArg, Ty},
+    walk::place_arg_ok,
 };
 
 type R = Result<(), HirError>;
 
-pub(super) fn scan(store: &Store, root: ItemId) -> R {
+pub(super) fn scan(store: &Store, root: ItemId, ctx: Ctx, sink: &mut Sink) -> R {
+    // The root is checked by `preflight`; every node is scanned in arena order.
+    let _ = root;
     let mut scan = Scan {
         s: store,
+        ctx,
         names: Vec::new(),
     };
-    scan.run(root)
+    scan.run(sink)
 }
 
 struct Scan<'a> {
     s: &'a Store,
-    /// Scratch for duplicate-name detection.
-    names: Vec<Symbol>,
+    ctx: Ctx,
+    /// Scratch for duplicate-name detection: (name, position).
+    names: Vec<(Symbol, u32)>,
 }
 
 fn malformed(site: Site, problem: Malformed) -> HirError {
     HirError::Malformed { site, problem }
 }
 
+/// Converts an arena position to a `u32` index (arena lengths never exceed
+/// `MAX_LEN`, so the fallback is never hit).
+#[inline]
+fn raw(i: usize) -> u32 {
+    u32::try_from(i).unwrap_or(u32::MAX - 1)
+}
+
+/// Returns `true` for the expressions that denote places.
+pub(crate) fn is_place(expr: Option<&Expr>) -> bool {
+    matches!(
+        expr,
+        Some(
+            Expr::Path(_)
+                | Expr::Field { .. }
+                | Expr::DynField { .. }
+                | Expr::Index { .. }
+                | Expr::Deref(_)
+                | Expr::VarVar(_)
+                | Expr::Append(_)
+                | Expr::Err
+        )
+    )
+}
+
 impl<'a> Scan<'a> {
-    fn run(&mut self, root: ItemId) -> R {
-        self.expansions()?;
-        if root.index() >= self.s.items.len() {
-            return Err(HirError::Dangling {
-                site: Site::Root,
-                kind: IdKind::Item,
-                index: root.index(),
-            });
+    fn run(&mut self, sink: &mut Sink) -> R {
+        for (i, e) in self.s.expansions.iter().enumerate() {
+            // Record `i` is expansion id `i + 1`; references must be strictly earlier.
+            let id = (i as u64) + 1;
+            if u64::from(e.parent.as_u32()) >= id || u64::from(e.def_site.as_u32()) >= id {
+                let expn = ExpnId::from_u32(u32::try_from(id).unwrap_or(u32::MAX));
+                sink.report(
+                    HirError::ExpansionOrder { expn },
+                    Repair::ExpansionRoot(i),
+                    true,
+                )?;
+            }
         }
         for (i, binder) in self.s.binders.nodes.iter().enumerate() {
-            let site = Site::Binder(BinderId::from_raw_index(raw(i)));
-            self.name(binder.name, site)?;
-            self.origin(self.s.binders.origin(i), site)?;
+            let b = BinderId::from_raw_index(raw(i));
+            let site = Site::Binder(b);
+            if let Err(e) = self.name(binder.name, site) {
+                sink.report(e, Repair::BinderMarkRoot(b), true)?;
+            }
+            if let Err(e) = self.origin(self.s.binders.origin(i), site) {
+                sink.report(e, Repair::BinderOriginRoot(b), true)?;
+            }
         }
-        for i in 0..self.s.items.len() {
-            self.item(ItemId::from_raw_index(raw(i)))?;
+        macro_rules! arena {
+            ($len:expr, $id:ident, $node:ident, $check:ident) => {
+                for i in 0..$len {
+                    let id = $id::from_raw_index(raw(i));
+                    let node = NodeRef::$node(id);
+                    if let Err(e) = self.origin(self.s.origin(node), Site::Node(node)) {
+                        sink.report(e, Repair::OriginRoot(node), true)?;
+                    }
+                    if let Err(e) = self.$check(id) {
+                        sink.report(e, Repair::ErrNode(node), true)?;
+                    }
+                }
+            };
         }
-        for i in 0..self.s.exprs.len() {
-            self.expr(ExprId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.stmts.len() {
-            self.stmt(StmtId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.pats.len() {
-            self.pat(PatId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.tys.len() {
-            self.ty(TyId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.paths.len() {
-            self.path(PathId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.fields.len() {
-            self.field(FieldId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.variants.len() {
-            self.variant(VariantId::from_raw_index(raw(i)))?;
-        }
-        for i in 0..self.s.params.len() {
-            self.param(ParamId::from_raw_index(raw(i)))?;
-        }
-        self.attrs()
+        arena!(self.s.items.len(), ItemId, Item, item);
+        arena!(self.s.exprs.len(), ExprId, Expr, expr);
+        arena!(self.s.stmts.len(), StmtId, Stmt, stmt);
+        arena!(self.s.pats.len(), PatId, Pat, pat);
+        arena!(self.s.tys.len(), TyId, Ty, ty);
+        arena!(self.s.paths.len(), PathId, Path, path);
+        arena!(self.s.fields.len(), FieldId, Field, field);
+        arena!(self.s.variants.len(), VariantId, Variant, variant);
+        arena!(self.s.params.len(), ParamId, Param, param);
+        self.attrs(sink)
     }
 
     // ---------------------------------------------------------------- ids
@@ -201,64 +239,97 @@ impl<'a> Scan<'a> {
         Ok(())
     }
 
+    fn bound(&self, b: Bound, site: Site) -> R {
+        match b {
+            Bound::Ty(t) => self.t(t, site),
+            Bound::Region(p) => self.pa(p, site),
+        }
+    }
+
+    fn bounds(&self, list: List<Bound>, site: Site) -> R {
+        for b in self.list(list, site)? {
+            self.bound(*b, site)?;
+        }
+        Ok(())
+    }
+
+    fn generic_arg(&self, a: GenericArg, site: Site) -> R {
+        match a {
+            GenericArg::Ty(t) | GenericArg::Binding { ty: t, .. } => self.t(t, site),
+            GenericArg::Const(e) => self.e(e, site),
+            GenericArg::Region(p) => self.pa(p, site),
+            GenericArg::Constraint { bounds, .. } => self.bounds(bounds, site),
+        }
+    }
+
+    fn generic_args(&self, list: List<GenericArg>, site: Site) -> R {
+        for a in self.list(list, site)? {
+            self.generic_arg(*a, site)?;
+        }
+        Ok(())
+    }
+
     fn text(&self, text: TextRef, site: Site) -> Result<&'a [u8], HirError> {
         text.range()
             .and_then(|r| self.s.text.get(r))
             .ok_or(HirError::TextOutOfBounds { site })
     }
 
-    /// Fails with `DuplicateName` if two of the collected names are equal.
+    /// Fails with `DuplicateName` at the first member, in list order, whose
+    /// name an earlier member already has.
     fn no_dups(&mut self, node: NodeRef) -> R {
         self.names.sort_unstable();
+        let mut first: Option<(Symbol, u32)> = None;
         for pair in self.names.windows(2) {
-            if let [a, b] = pair {
-                if a == b {
-                    return Err(HirError::DuplicateName { node, name: *a });
+            if let [(a, _), (b, at)] = pair {
+                if a == b && first.is_none_or(|(_, f)| *at < f) {
+                    first = Some((*b, *at));
                 }
             }
         }
-        Ok(())
+        match first {
+            Some((name, index)) => Err(HirError::DuplicateName { node, name, index }),
+            None => Ok(()),
+        }
+    }
+
+    fn push_name(&mut self, sym: Symbol, at: usize) {
+        self.names.push((sym, raw(at)));
     }
 
     // ---------------------------------------------------------- tables
 
-    fn expansions(&self) -> R {
-        for (i, e) in self.s.expansions.iter().enumerate() {
-            // Record `i` is expansion id `i + 1`; references must be strictly earlier.
-            let id = (i as u64) + 1;
-            let expn = ExpnId::from_u32(u32::try_from(id).unwrap_or(u32::MAX));
-            if u64::from(e.parent.as_u32()) >= id || u64::from(e.def_site.as_u32()) >= id {
-                return Err(HirError::ExpansionOrder { expn });
-            }
-        }
-        Ok(())
-    }
-
-    fn attrs(&self) -> R {
+    fn attrs(&self, sink: &mut Sink) -> R {
         let mut prev: Option<NodeRef> = None;
-        for (target, list) in &self.s.attrs {
+        for (i, (target, list)) in self.s.attrs.iter().enumerate() {
             let site = Site::Attrs(*target);
-            if target.index() >= self.s.arena_len(*target) {
-                return Err(HirError::Dangling {
-                    site,
-                    kind: target.kind(),
-                    index: target.index(),
-                });
-            }
-            if prev.is_some_and(|p| p >= *target) {
-                return Err(malformed(site, Malformed::AttrOrder));
-            }
-            prev = Some(*target);
-            for attr in self.list(*list, site)? {
-                for arg in self.list(attr.args, site)? {
-                    match arg.value {
-                        None if arg.key.is_none() => {
-                            return Err(malformed(site, Malformed::EmptyAttrArg));
+            let check = || -> R {
+                if target.index() >= self.s.arena_len(*target) {
+                    return Err(HirError::Dangling {
+                        site,
+                        kind: target.kind(),
+                        index: target.index(),
+                    });
+                }
+                if prev.is_some_and(|p| p >= *target) {
+                    return Err(malformed(site, Malformed::AttrOrder));
+                }
+                for attr in self.list(*list, site)? {
+                    for arg in self.list(attr.args, site)? {
+                        match arg.value {
+                            None if arg.key.is_none() => {
+                                return Err(malformed(site, Malformed::EmptyAttrArg));
+                            }
+                            Some(crate::item::AttrValue::Lit(lit)) => self.lit(lit, site)?,
+                            _ => {}
                         }
-                        Some(crate::item::AttrValue::Lit(lit)) => self.lit(lit, site)?,
-                        _ => {}
                     }
                 }
+                Ok(())
+            };
+            match check() {
+                Ok(()) => prev = Some(*target),
+                Err(e) => sink.report(e, Repair::DropAttr(i), true)?,
             }
         }
         Ok(())
@@ -269,11 +340,16 @@ impl<'a> Scan<'a> {
     fn lit(&self, lit: Lit, site: Site) -> R {
         match lit {
             Lit::Null | Lit::Bool(_) | Lit::Char(_) => Ok(()),
-            Lit::Int(int) => match int.suffix {
-                Some(p) if !p.is_int() => Err(malformed(site, Malformed::LiteralSuffix)),
-                Some(p) if !int.fits(p) => Err(malformed(site, Malformed::LiteralOutOfRange)),
-                _ => Ok(()),
-            },
+            Lit::Int(int) => {
+                if int.negative && int.value == 0 {
+                    return Err(malformed(site, Malformed::NegativeZero));
+                }
+                match int.suffix {
+                    Some(p) if !p.is_int() => Err(malformed(site, Malformed::LiteralSuffix)),
+                    Some(p) if !int.fits(p) => Err(malformed(site, Malformed::LiteralOutOfRange)),
+                    _ => Ok(()),
+                }
+            }
             Lit::Float(f) => match f.suffix {
                 Some(p) if !p.is_float() => Err(malformed(site, Malformed::LiteralSuffix)),
                 _ if !f.is_exact() => Err(malformed(site, Malformed::InexactF32)),
@@ -305,18 +381,22 @@ impl<'a> Scan<'a> {
     fn generics(&self, g: &Generics, site: Site) -> R {
         for gp in self.list(g.params, site)? {
             self.b(gp.binder, site)?;
-            self.tys(gp.bounds, site)?;
+            self.bounds(gp.bounds, site)?;
             self.ot(gp.ty, site)?;
-            self.ot(gp.default, site)?;
+            if let Some(d) = gp.default {
+                self.generic_arg(d, site)?;
+            }
         }
         for wp in self.list(g.preds, site)? {
-            self.t(wp.ty, site)?;
-            self.tys(wp.bounds, site)?;
+            self.bound(wp.subject, site)?;
+            self.bounds(wp.bounds, site)?;
         }
         Ok(())
     }
 
-    /// Checks parameter ids and the kind order shared by functions and closures.
+    /// Checks parameter ids and the kind order shared by functions and
+    /// closures; problems are reported at the owner, whose repair removes
+    /// the parameter list's problem with it.
     fn params(&self, list: List<ParamId>, site: Site, closure: bool) -> R {
         let ids = self.list(list, site)?;
         let mut last: Option<ParamKind> = None;
@@ -325,9 +405,8 @@ impl<'a> Scan<'a> {
             let Some(param) = self.s.param(*id) else {
                 continue;
             };
-            let psite = Site::Node(NodeRef::Param(*id));
             if param.kind == ParamKind::Receiver && closure {
-                return Err(malformed(psite, Malformed::ReceiverPlacement));
+                return Err(malformed(site, Malformed::ReceiverPlacement));
             }
             let single = matches!(
                 param.kind,
@@ -336,12 +415,12 @@ impl<'a> Scan<'a> {
             match last {
                 // Kinds are non-decreasing; the single-use kinds strictly increase.
                 Some(prev) if prev > param.kind || (single && prev == param.kind) => {
-                    return Err(malformed(psite, Malformed::ParamOrder));
+                    return Err(malformed(site, Malformed::ParamOrder));
                 }
                 _ => {}
             }
             if single && param.default.is_some() {
-                return Err(malformed(psite, Malformed::ParamDefault));
+                return Err(malformed(site, Malformed::ParamDefault));
             }
             last = Some(param.kind);
         }
@@ -352,7 +431,7 @@ impl<'a> Scan<'a> {
     fn fields(&mut self, list: List<FieldId>, shape: Shape, node: NodeRef) -> R {
         let site = Site::Node(node);
         self.names.clear();
-        for id in self.list(list, site)? {
+        for (at, id) in self.list(list, site)?.iter().enumerate() {
             self.id(id.index(), self.s.fields.len(), IdKind::Field, site)?;
             let named = self.s.field(*id).and_then(|f| f.name);
             let fits = match shape {
@@ -364,7 +443,7 @@ impl<'a> Scan<'a> {
                 return Err(malformed(site, Malformed::ShapeFields));
             }
             if let Some(name) = named {
-                self.names.push(name.sym);
+                self.push_name(name.sym, at);
             }
         }
         self.no_dups(node)
@@ -376,7 +455,6 @@ impl<'a> Scan<'a> {
         let Some(item) = self.s.item(id) else {
             return Ok(());
         };
-        self.origin(self.s.items.origin(id.index()), site)?;
         if let Some(name) = item.name {
             self.name(name, site)?;
         }
@@ -390,7 +468,9 @@ impl<'a> Scan<'a> {
             | ItemKind::AssocType { .. }
             | ItemKind::Const { .. }
             | ItemKind::Global { .. } => Some(true),
-            ItemKind::Impl(_) | ItemKind::Import { glob: true, .. } => Some(false),
+            ItemKind::Impl(_) | ItemKind::MixinUse(_) | ItemKind::Import { glob: true, .. } => {
+                Some(false)
+            }
             ItemKind::Module { .. } | ItemKind::Import { .. } | ItemKind::Err => None,
         };
         match (needs_name, item.name.is_some()) {
@@ -408,22 +488,25 @@ impl<'a> Scan<'a> {
             }
             ItemKind::Record(r) => {
                 self.generics(&r.generics, site)?;
+                if r.is_union && r.shape != Shape::Named {
+                    return Err(malformed(site, Malformed::ShapeFields));
+                }
                 self.fields(r.fields, r.shape, node)
             }
             ItemKind::Sum(d) => {
                 self.generics(&d.generics, site)?;
                 self.names.clear();
-                for v in self.list(d.variants, site)? {
+                for (at, v) in self.list(d.variants, site)?.iter().enumerate() {
                     self.id(v.index(), self.s.variants.len(), IdKind::Variant, site)?;
                     if let Some(variant) = self.s.variant(*v) {
-                        self.names.push(variant.name.sym);
+                        self.push_name(variant.name.sym, at);
                     }
                 }
                 self.no_dups(node)
             }
             ItemKind::Class(c) => {
                 self.generics(&c.generics, site)?;
-                self.ot(c.base, site)?;
+                self.tys(c.bases, site)?;
                 self.tys(c.interfaces, site)?;
                 self.items(c.items, site)?;
                 self.fields(c.fields, Shape::Named, node)
@@ -444,7 +527,7 @@ impl<'a> Scan<'a> {
                 self.t(*ty, site)
             }
             ItemKind::AssocType { bounds, default } => {
-                self.tys(*bounds, site)?;
+                self.bounds(*bounds, site)?;
                 self.ot(*default, site)
             }
             ItemKind::Const { ty, value } => {
@@ -455,8 +538,21 @@ impl<'a> Scan<'a> {
                 self.ot(*ty, site)?;
                 self.oe(*init, site)
             }
-            ItemKind::Module { items } => self.items(*items, site),
+            ItemKind::Module { items, body, .. } => {
+                self.items(*items, site)?;
+                self.oe(*body, site)
+            }
             ItemKind::Import { path, .. } => self.pa(*path, site),
+            ItemKind::MixinUse(m) => {
+                self.tys(m.mixins, site)?;
+                for rule in self.list(m.rules, site)? {
+                    self.ot(rule.from, site)?;
+                    if let MixinAction::Insteadof(others) = rule.action {
+                        self.tys(others, site)?;
+                    }
+                }
+                Ok(())
+            }
             ItemKind::Err => Ok(()),
         }
     }
@@ -466,7 +562,6 @@ impl<'a> Scan<'a> {
         let Some(field) = self.s.field(id) else {
             return Ok(());
         };
-        self.origin(self.s.fields.origin(id.index()), site)?;
         self.ot(field.ty, site)?;
         self.oe(field.default, site)
     }
@@ -477,7 +572,6 @@ impl<'a> Scan<'a> {
         let Some(variant) = self.s.variant(id) else {
             return Ok(());
         };
-        self.origin(self.s.variants.origin(id.index()), site)?;
         self.oe(variant.discriminant, site)?;
         self.fields(variant.fields, variant.shape, node)
     }
@@ -487,7 +581,6 @@ impl<'a> Scan<'a> {
         let Some(param) = self.s.param(id) else {
             return Ok(());
         };
-        self.origin(self.s.params.origin(id.index()), site)?;
         self.p(param.pat, site)?;
         self.ot(param.ty, site)?;
         self.oe(param.default, site)
@@ -495,13 +588,16 @@ impl<'a> Scan<'a> {
 
     // ------------------------------------------------------ expressions
 
-    fn args(&mut self, list: List<crate::expr::Arg>, node: NodeRef) -> R {
+    fn args(&mut self, list: List<Arg>, node: NodeRef) -> R {
         let site = Site::Node(node);
         self.names.clear();
-        for arg in self.list(list, site)? {
+        for (at, arg) in self.list(list, site)?.iter().enumerate() {
             self.e(arg.value, site)?;
-            if let ArgKind::Named(name) = arg.kind {
-                self.names.push(name.sym);
+            if arg.place && (!place_arg_ok(arg.kind) || !is_place(self.s.expr(arg.value))) {
+                return Err(malformed(site, Malformed::PlaceArg));
+            }
+            if let crate::expr::ArgKind::Named(name) = arg.kind {
+                self.push_name(name.sym, at);
             }
         }
         self.no_dups(node)
@@ -521,7 +617,6 @@ impl<'a> Scan<'a> {
         let Some(expr) = self.s.expr(id) else {
             return Ok(());
         };
-        self.origin(self.s.exprs.origin(id.index()), site)?;
         match *expr {
             Expr::Lit(lit) => self.lit(lit, site),
             Expr::Path(p) => self.pa(p, site),
@@ -533,9 +628,9 @@ impl<'a> Scan<'a> {
             Expr::Record { path, fields, base } => {
                 self.opa(path, site)?;
                 self.names.clear();
-                for fi in self.list(fields, site)? {
+                for (at, fi) in self.list(fields, site)?.iter().enumerate() {
                     self.e(fi.value, site)?;
-                    self.names.push(fi.name.sym);
+                    self.push_name(fi.name.sym, at);
                 }
                 self.no_dups(node)?;
                 self.oe(base, site)
@@ -558,10 +653,23 @@ impl<'a> Scan<'a> {
                 ..
             } => {
                 self.e(receiver, site)?;
-                self.tys(generic_args, site)?;
+                self.generic_args(generic_args, site)?;
                 self.args(args, node)
             }
-            Expr::Field { base, .. } => self.e(base, site),
+            Expr::DynMethodCall {
+                receiver,
+                name,
+                args,
+            } => {
+                self.e(receiver, site)?;
+                self.e(name, site)?;
+                self.args(args, node)
+            }
+            Expr::Field { base, .. } | Expr::Deref(base) => self.e(base, site),
+            Expr::DynField { base, name } => {
+                self.e(base, site)?;
+                self.e(name, site)
+            }
             Expr::Index { base, index } => {
                 self.e(base, site)?;
                 self.e(index, site)
@@ -592,7 +700,7 @@ impl<'a> Scan<'a> {
                     return Err(HirError::Policy { expr: id });
                 }
                 // A cast's result has its target type; only `Any` is dynamic.
-                let promotes = matches!(policy.overflow, Some(crate::ops::Overflow::Promote));
+                let promotes = matches!(policy.overflow, Some(Overflow::Promote));
                 if promotes && !matches!(self.s.ty(ty), Some(Ty::Any)) {
                     return Err(malformed(site, Malformed::PromoteOnStaticResult));
                 }
@@ -602,27 +710,34 @@ impl<'a> Scan<'a> {
                 self.e(target, site)?;
                 self.e(value, site)?;
                 if let Some(op) = op {
-                    if op.kind.arity() != 2 {
+                    if !compound_op(op.kind) {
                         return Err(malformed(site, Malformed::CompoundAssignOp));
                     }
                     self.policy(id, op)?;
                 }
-                match self.s.expr(target) {
-                    Some(
-                        Expr::Path(_)
-                        | Expr::Field { .. }
-                        | Expr::Index { .. }
-                        | Expr::Deref(_)
-                        | Expr::Err,
-                    ) => Ok(()),
-                    _ => Err(malformed(site, Malformed::AssignTarget)),
+                if is_place(self.s.expr(target)) {
+                    Ok(())
+                } else {
+                    Err(malformed(site, Malformed::AssignTarget))
                 }
             }
-            Expr::Deref(x)
-            | Expr::Borrow { expr: x, .. }
+            Expr::RefAssign { target, source } => {
+                self.e(target, site)?;
+                self.e(source, site)?;
+                let source_ok = is_place(self.s.expr(source))
+                    && !matches!(self.s.expr(source), Some(Expr::Append(_)));
+                if is_place(self.s.expr(target)) && source_ok {
+                    Ok(())
+                } else {
+                    Err(malformed(site, Malformed::AssignTarget))
+                }
+            }
+            Expr::Borrow { expr: x, .. }
             | Expr::Throw(x)
             | Expr::Await(x)
-            | Expr::Spawn(x) => self.e(x, site),
+            | Expr::Spawn(x)
+            | Expr::VarVar(x)
+            | Expr::Append(x) => self.e(x, site),
             Expr::Block(block) => {
                 for st in self.list(block.stmts, site)? {
                     self.id(st.index(), self.s.stmts.len(), IdKind::Stmt, site)?;
@@ -654,6 +769,7 @@ impl<'a> Scan<'a> {
                 self.params(c.params, site, true)?;
                 self.ot(c.ret, site)?;
                 self.e(c.body, site)?;
+                self.ob(c.self_binder, site)?;
                 for cap in self.list(c.captures, site)? {
                     self.pa(cap.outer, site)?;
                     self.b(cap.binder, site)?;
@@ -671,6 +787,43 @@ impl<'a> Scan<'a> {
                 self.e(body, site)?;
                 self.arms(catches, site)?;
                 self.oe(finally, site)
+            }
+            Expr::Asm(asm) => {
+                let operands = self.list(asm.operands, site)?;
+                let template = self.text(asm.template, site)?;
+                if !template_ok(template, operands.len()) {
+                    return Err(malformed(site, Malformed::AsmTemplate));
+                }
+                for op in operands {
+                    self.e(op.expr, site)?;
+                    let constraint = self.text(op.constraint, site)?;
+                    let target = self.s.expr(op.expr);
+                    let ok = core::str::from_utf8(constraint).is_ok()
+                        && match op.dir {
+                            AsmDir::Out | AsmDir::InOut => is_place(target),
+                            AsmDir::Sym => matches!(target, Some(Expr::Path(_))),
+                            AsmDir::In | AsmDir::Const => true,
+                        };
+                    if !ok {
+                        return Err(malformed(site, Malformed::AsmOperand));
+                    }
+                }
+                Ok(())
+            }
+            Expr::Intrinsic {
+                kind,
+                generic_args,
+                args,
+            } => {
+                self.generic_args(generic_args, site)?;
+                self.exprs(args, site)?;
+                if kind.arity().is_some_and(|n| n != args.len()) {
+                    return Err(malformed(site, Malformed::IntrinsicArity));
+                }
+                if !kind.orderings_ok() {
+                    return Err(malformed(site, Malformed::MemOrder));
+                }
+                Ok(())
             }
             Expr::Err => Ok(()),
         }
@@ -690,7 +843,6 @@ impl<'a> Scan<'a> {
         let Some(stmt) = self.s.stmt(id) else {
             return Ok(());
         };
-        self.origin(self.s.stmts.origin(id.index()), site)?;
         match *stmt {
             Stmt::Let {
                 pat,
@@ -709,6 +861,15 @@ impl<'a> Scan<'a> {
             }
             Stmt::Expr(e) | Stmt::Defer(e) => self.e(e, site),
             Stmt::Item(i) => self.i(i, site),
+            Stmt::Static { binder, ty, init } => {
+                self.b(binder, site)?;
+                self.ot(ty, site)?;
+                self.oe(init, site)
+            }
+            Stmt::Global { binder, path } => {
+                self.b(binder, site)?;
+                self.pa(path, site)
+            }
             Stmt::Err => Ok(()),
         }
     }
@@ -721,38 +882,38 @@ impl<'a> Scan<'a> {
         let Some(pat) = self.s.pat(id) else {
             return Ok(());
         };
-        self.origin(self.s.pats.origin(id.index()), site)?;
         match *pat {
             Pat::Wild | Pat::Err => Ok(()),
             Pat::Bind { binder, sub, .. } => {
                 self.b(binder, site)?;
                 self.op_(sub, site)
             }
+            Pat::Ident { binder, path } => {
+                self.b(binder, site)?;
+                self.pa(path, site)
+            }
             Pat::Lit(lit) => self.lit(lit, site),
             Pat::Range { lo, hi, .. } => {
+                self.op_(lo, site)?;
+                self.op_(hi, site)?;
                 if lo.is_none() && hi.is_none() {
                     return Err(malformed(site, Malformed::RangeWithoutBounds));
                 }
-                let class = |lit: Lit| match lit {
-                    Lit::Int(_) => Some(0u8),
-                    Lit::Char(_) => Some(1),
-                    Lit::Float(_) => Some(2),
-                    _ => None,
+                // Bounds are literal or constant-path patterns; literals of one class.
+                let class = |p: Option<PatId>| -> Result<Option<u8>, HirError> {
+                    match p.and_then(|p| self.s.pat(p)) {
+                        None | Some(Pat::Path(_)) => Ok(None),
+                        Some(Pat::Lit(Lit::Int(_))) => Ok(Some(0)),
+                        Some(Pat::Lit(Lit::Char(_))) => Ok(Some(1)),
+                        Some(Pat::Lit(Lit::Float(_))) => Ok(Some(2)),
+                        Some(Pat::Lit(_)) => Err(malformed(site, Malformed::RangeBoundKinds)),
+                        Some(_) => Err(malformed(site, Malformed::RangeBound)),
+                    }
                 };
-                let classes = [lo.map(class), hi.map(class)];
-                if classes.iter().any(|c| matches!(c, Some(None))) {
-                    return Err(malformed(site, Malformed::RangeBoundKinds));
-                }
-                if let [Some(a), Some(b)] = classes {
+                if let (Some(a), Some(b)) = (class(lo)?, class(hi)?) {
                     if a != b {
                         return Err(malformed(site, Malformed::RangeBoundKinds));
                     }
-                }
-                if let Some(lo) = lo {
-                    self.lit(lo, site)?;
-                }
-                if let Some(hi) = hi {
-                    self.lit(hi, site)?;
                 }
                 Ok(())
             }
@@ -764,9 +925,9 @@ impl<'a> Scan<'a> {
             Pat::Record { path, fields, .. } => {
                 self.opa(path, site)?;
                 self.names.clear();
-                for fp in self.list(fields, site)? {
+                for (at, fp) in self.list(fields, site)?.iter().enumerate() {
                     self.p(fp.pat, site)?;
-                    self.names.push(fp.name.sym);
+                    self.push_name(fp.name.sym, at);
                 }
                 self.no_dups(node)
             }
@@ -810,11 +971,11 @@ impl<'a> Scan<'a> {
         let Some(ty) = self.s.ty(id) else {
             return Ok(());
         };
-        self.origin(self.s.tys.origin(id.index()), site)?;
         match *ty {
             Ty::Infer | Ty::Prim(_) | Ty::Any | Ty::Never | Ty::SelfTy | Ty::Err => Ok(()),
             Ty::Path(p) => self.pa(p, site),
-            Ty::Tuple(ts) | Ty::Object(ts) => self.tys(ts, site),
+            Ty::Tuple(ts) => self.tys(ts, site),
+            Ty::Object(bs) | Ty::Impl(bs) => self.bounds(bs, site),
             Ty::Array { elem, len } => {
                 self.t(elem, site)?;
                 self.e(len, site)
@@ -834,7 +995,6 @@ impl<'a> Scan<'a> {
                 self.t(ret, site)?;
                 self.ot(throws, site)
             }
-            Ty::Const(e) => self.e(e, site),
         }
     }
 
@@ -843,28 +1003,59 @@ impl<'a> Scan<'a> {
         let Some(path) = self.s.path(id) else {
             return Ok(());
         };
-        self.origin(self.s.paths.origin(id.index()), site)?;
         let segments = self.list(path.segments, site)?;
-        if segments.is_empty() {
+        if segments.is_empty() && path.res != Res::Err {
             return Err(malformed(site, Malformed::EmptyPath));
         }
         for seg in segments {
             self.name(seg.name, site)?;
             self.origin(seg.origin, site)?;
-            self.tys(seg.args, site)?;
+            self.generic_args(seg.args, site)?;
+        }
+        if let Some(q) = path.qself {
+            self.t(q.ty, site)?;
+            if path.root != PathRoot::Relative || q.trait_len as usize >= segments.len() {
+                return Err(malformed(site, Malformed::PathShape));
+            }
+        }
+        if path.root == PathRoot::Super(0) {
+            return Err(malformed(site, Malformed::PathShape));
         }
         match path.res {
             Res::Local(b) => self.b(b, site),
-            Res::Item(i) => self.i(i, site),
-            Res::Variant(v) => self.id(v.index(), self.s.variants.len(), IdKind::Variant, site),
-            Res::Unresolved | Res::Prim(_) | Res::Err => Ok(()),
+            Res::Def(def) => match def.def() {
+                // Only this unit's definitions can be checked here; the tag
+                // and kind are checked with the namespace in the tree walk.
+                Def::Item(i) if def.unit() == self.unit() => self.i(i, site),
+                Def::Variant(v) if def.unit() == self.unit() => {
+                    self.id(v.index(), self.s.variants.len(), IdKind::Variant, site)
+                }
+                _ => Ok(()),
+            },
+            Res::Unresolved | Res::Prim(_) | Res::Extern(_) | Res::Err => Ok(()),
         }
+    }
+
+    fn unit(&self) -> crate::def::UnitId {
+        self.ctx.unit
     }
 }
 
-/// Converts an arena position to a `u32` index. Arena lengths never exceed
-/// `MAX_LEN` (the builder refuses to grow past it), so the fallback is never hit.
-#[inline]
-fn raw(i: usize) -> u32 {
-    u32::try_from(i).unwrap_or(u32::MAX - 1)
+/// The ops a compound assignment may use: arithmetic, bitwise, and shifts.
+const fn compound_op(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Add
+            | OpKind::Sub
+            | OpKind::Mul
+            | OpKind::Div
+            | OpKind::FloorDiv
+            | OpKind::Rem
+            | OpKind::FloorMod
+            | OpKind::And
+            | OpKind::Or
+            | OpKind::Xor
+            | OpKind::Shl
+            | OpKind::Shr
+    )
 }

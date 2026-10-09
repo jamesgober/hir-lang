@@ -76,10 +76,13 @@
 extern crate alloc;
 
 mod builder;
+mod copy;
+mod def;
 mod error;
 mod expr;
 mod hir;
 mod id;
+mod intrinsic;
 mod item;
 mod lit;
 mod name;
@@ -93,10 +96,11 @@ mod validate;
 mod walk;
 
 pub use builder::Builder;
+pub use def::{Def, DefId, UnitId};
 pub use error::{Capacity, EffectProblem, HirError, JumpProblem, Malformed, Site};
 pub use expr::{
-    Arg, ArgKind, Arm, Block, BorrowKind, Capture, CaptureMode, Closure, Expr, FieldInit, MapEntry,
-    Member, Stmt,
+    Arg, ArgKind, Arm, Block, BorrowKind, Capture, CaptureMode, Closure, DefaultEval, Expr,
+    FieldInit, MapEntry, Member, Stmt,
 };
 pub use hir::Hir;
 pub use id::{
@@ -104,21 +108,22 @@ pub use id::{
     TextRef, TyId, VariantId,
 };
 pub use intern_lang::Symbol;
+pub use intrinsic::{Asm, AsmDir, AsmOperand, AsmOptions, Intrinsic, MemOrder, RmwOp};
 pub use item::{
     Attr, AttrArg, AttrValue, ClassDef, FieldDef, FnDef, GenericParam, Generics, ImplDef,
-    InterfaceDef, Item, ItemKind, Param, ParamKind, RecordDef, Shape, SumDef, Variant, Vis,
-    WherePred,
+    InterfaceDef, Item, ItemKind, MixinAction, MixinRule, MixinUseDef, Param, ParamKind, RecordDef,
+    Shape, SumDef, Variant, Vis, WherePred,
 };
 pub use lit::{FloatLit, IntLit, Lit, Prim};
-pub use name::{Binder, BinderKind, Ns, Path, Res, Segment};
+pub use name::{Binder, BinderKind, Ns, Path, PathRoot, QSelf, Res, Segment};
 pub use ops::{DivZero, FloatToInt, Op, OpKind, Overflow, Policy, Shift};
 pub use origin::{Expansion, ExpnId, ExpnKind, Ident, Name, Origin};
 pub use pat::{BindMode, FieldPat, Pat, SliceRest};
 pub use print::{PrintOptions, print, print_into, print_with};
 pub use span_lang::Span;
 pub use store::Pooled;
-pub use ty::{Effects, Ty};
-pub use walk::{Control, Event};
+pub use ty::{Bound, Effects, GenericArg, Ty};
+pub use walk::{Control, Event, Frame};
 
 /// Visits every node of `hir` in canonical preorder, from the root.
 ///
@@ -138,13 +143,8 @@ pub use walk::{Control, Event};
 /// assert_eq!(seen, [NodeRef::Item(root)]);
 /// # Ok::<(), hir_lang::HirError>(())
 /// ```
-pub fn walk<F: FnMut(NodeRef)>(hir: &Hir, mut f: F) {
-    hir.walk_from(NodeRef::Item(hir.root()), |event| {
-        if let Event::Enter(node) = event {
-            f(node);
-        }
-        Control::Continue
-    });
+pub fn walk<F: FnMut(NodeRef)>(hir: &Hir, f: F) {
+    walk::walk_nodes(hir.store(), NodeRef::Item(hir.root()), f);
 }
 
 /// Compiles and runs the `rust` code blocks in `README.md` and `docs/API.md` as
@@ -161,14 +161,18 @@ mod tests {
     /// The README states node sizes; keep them from growing unnoticed.
     #[test]
     fn test_node_sizes_stay_small() {
-        assert_eq!(core::mem::size_of::<Expr>(), 40);
-        // Patterns are dominated by `Range`'s two optional literals.
-        assert!(core::mem::size_of::<Pat>() <= 56);
-        assert!(core::mem::size_of::<Ty>() <= 20);
-        assert!(core::mem::size_of::<Stmt>() <= 20);
-        assert!(core::mem::size_of::<Path>() <= 20);
-        assert!(core::mem::size_of::<Item>() <= 72);
-        assert_eq!(core::mem::size_of::<Origin>(), 12);
-        assert_eq!(core::mem::size_of::<Option<ExprId>>(), 4);
+        let sizes = [
+            core::mem::size_of::<Expr>(),
+            core::mem::size_of::<Pat>(),
+            core::mem::size_of::<Ty>(),
+            core::mem::size_of::<Stmt>(),
+            core::mem::size_of::<Path>(),
+            core::mem::size_of::<Item>(),
+            core::mem::size_of::<Origin>(),
+            core::mem::size_of::<Option<ExprId>>(),
+        ];
+        // Paths grew in 0.3 (root, qualified self, partial resolution, a
+        // unit-qualified `DefId`); patterns shrank (range bounds are nodes).
+        assert_eq!(sizes, [40, 32, 24, 20, 40, 72, 12, 4]);
     }
 }

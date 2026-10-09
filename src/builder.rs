@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use span_lang::Span;
 
 use crate::{
+    def::{Def, DefId, UnitId, next_tag},
     error::{Capacity, HirError},
     expr::{Arg, Block, Expr, Stmt},
     hir::Hir,
@@ -19,8 +20,9 @@ use crate::{
     origin::{Expansion, ExpnId, Name, Origin},
     pat::{BindMode, Pat},
     store::{Arena, Pooled, Store},
+    ty::Effects,
     ty::Ty,
-    validate::validate,
+    validate::{Ctx, validate, validate_lenient},
 };
 
 /// Builds a [`Hir`] bottom-up: children first, then the parent that lists them.
@@ -57,16 +59,26 @@ use crate::{
 /// assert_eq!(hir.origin(hir_lang::NodeRef::Expr(sum)).span, Span::new(15, 20));
 /// # Ok::<(), hir_lang::HirError>(())
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Builder {
     store: Store,
     origin: Origin,
     overflow: Option<Capacity>,
     attrs: Vec<(NodeRef, List<Attr>)>,
+    unit: UnitId,
+    tag: u32,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::for_unit(UnitId::default())
+    }
 }
 
 impl Builder {
-    /// An empty builder; the current origin is `0..0` in source.
+    /// An empty builder for unit 0; the current origin is `0..0` in source.
+    /// Single-unit tools use this; a host with several units uses
+    /// [`for_unit`](Self::for_unit).
     ///
     /// # Examples
     ///
@@ -78,6 +90,71 @@ impl Builder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty builder for the compilation unit `unit` (host-assigned).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, UnitId};
+    ///
+    /// let b = Builder::for_unit(UnitId::new(3));
+    /// assert_eq!(b.unit(), UnitId::new(3));
+    /// ```
+    #[must_use]
+    pub fn for_unit(unit: UnitId) -> Self {
+        Self {
+            store: Store::default(),
+            origin: Origin::default(),
+            overflow: None,
+            attrs: Vec::new(),
+            unit,
+            tag: next_tag(),
+        }
+    }
+
+    /// Returns the unit being built.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, UnitId};
+    ///
+    /// assert_eq!(Builder::new().unit(), UnitId::new(0));
+    /// ```
+    #[must_use]
+    pub fn unit(&self) -> UnitId {
+        self.unit
+    }
+
+    /// Returns the `DefId` naming a definition of this unit, to store in a
+    /// path's resolution (`Res::Def`). It carries this builder's tag, so it
+    /// cannot be mistaken for an id of another `Hir`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, Def, Name, Ns, Res};
+    /// use intern_lang::Interner;
+    ///
+    /// let mut names = Interner::new();
+    /// let mut b = Builder::new();
+    /// let helper_name = Name::new(names.intern("helper"));
+    /// let hbody = b.block(&[], None);
+    /// let helper = b.func(helper_name, &[], hbody);
+    /// let def = b.def(Def::Item(helper));
+    /// let callee_path = b.resolved_path(helper_name, Ns::Value, Res::Def(def));
+    /// let callee = b.expr(hir_lang::Expr::Path(callee_path));
+    /// let call = b.call(callee, &[]);
+    /// let body = b.block(&[], Some(call));
+    /// let main = b.func(Name::new(names.intern("main")), &[], body);
+    /// let root = b.module(None, &[helper, main]);
+    /// assert!(b.finish(root).is_ok());
+    /// ```
+    #[must_use]
+    pub fn def(&self, def: Def) -> DefId {
+        DefId::tagged(self.unit, def, self.tag)
     }
 
     // ---------------------------------------------------------- origins
@@ -227,7 +304,7 @@ impl Builder {
     /// use hir_lang::{Builder, Item, ItemKind, List};
     ///
     /// let mut b = Builder::new();
-    /// let m = b.item(Item::new(None, ItemKind::Module { items: List::EMPTY }));
+    /// let m = b.item(Item::new(None, ItemKind::Module { items: List::EMPTY, body: None, effects: hir_lang::Effects::NONE }));
     /// assert!(b.finish(m).is_ok());
     /// ```
     pub fn item(&mut self, item: Item) -> ItemId {
@@ -339,7 +416,7 @@ impl Builder {
     /// let mut b = Builder::new();
     /// let seg = Segment::new(Name::new(names.intern("Vec")), b.origin());
     /// let segments = b.list(&[seg]);
-    /// let path = b.path(Path { segments, ns: Ns::Type, res: Res::Unresolved, global: false });
+    /// let path = b.path(Path { res: Res::Unresolved, ..Path::new(segments, Ns::Type) });
     /// assert_eq!(path.index(), 0);
     /// ```
     pub fn path(&mut self, path: Path) -> PathId {
@@ -444,22 +521,10 @@ impl Builder {
     /// assert!(b.list::<hir_lang::ExprId>(&[]).is_empty());
     /// ```
     pub fn list<T: Pooled>(&mut self, elems: &[T]) -> List<T> {
-        if elems.is_empty() {
-            return List::EMPTY;
-        }
-        let pool = T::pool_mut(&mut self.store);
-        let start = pool.len();
-        let fits = start
-            .checked_add(elems.len())
-            .is_some_and(|end| end <= MAX_LEN);
-        let (Ok(start32), Ok(len32), true) =
-            (u32::try_from(start), u32::try_from(elems.len()), fits)
-        else {
+        self.store.push_list(elems).unwrap_or_else(|| {
             self.overflow = Some(Capacity::Pool);
-            return List::EMPTY;
-        };
-        pool.extend_from_slice(elems);
-        List::from_raw(start32, len32)
+            List::EMPTY
+        })
     }
 
     /// Stores string-literal text and returns its reference.
@@ -725,10 +790,8 @@ impl Builder {
         let segment = Segment::new(name, self.origin);
         let segments = self.list(&[segment]);
         self.path(Path {
-            segments,
-            ns,
             res,
-            global: false,
+            ..Path::new(segments, ns)
         })
     }
 
@@ -772,10 +835,8 @@ impl Builder {
             // A foreign binder id: build an empty path, which the validator
             // reports, rather than failing here.
             None => self.path(Path {
-                segments: List::EMPTY,
-                ns: Ns::Value,
                 res: Res::Local(binder),
-                global: false,
+                ..Path::new(List::EMPTY, Ns::Value)
             }),
         };
         self.expr(Expr::Path(path))
@@ -884,7 +945,60 @@ impl Builder {
     /// ```
     pub fn module(&mut self, name: Option<Name>, items: &[ItemId]) -> ItemId {
         let items = self.list(items);
-        self.item(Item::new(name, ItemKind::Module { items }))
+        self.item(Item::new(
+            name,
+            ItemKind::Module {
+                items,
+                body: None,
+                effects: Effects::NONE,
+            },
+        ))
+    }
+
+    /// Copies the subtree under `node` and returns the copy's root.
+    ///
+    /// Every binder *bound inside* the subtree is replaced by a fresh binder
+    /// in the copy (references inside follow it); references to binders bound
+    /// outside keep pointing at them. Origins and attributes are copied. The
+    /// copy is unattached: place it as a child like any new node. For template
+    /// instantiation, inlining, and unrolling. Iterative: any depth is safe.
+    ///
+    /// If `node` does not exist, or an arena would overflow, the overflow is
+    /// recorded (reported by `finish`) and `node` itself is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{BinderKind, Builder, Expr, Name, NodeRef, Stmt};
+    /// use intern_lang::Interner;
+    ///
+    /// // { let t = 1; t } used twice: the copy gets its own `t`.
+    /// let mut names = Interner::new();
+    /// let mut b = Builder::new();
+    /// let t = b.new_binder(Name::new(names.intern("t")), BinderKind::Local);
+    /// let pat = b.bind(t);
+    /// let one = b.int(1);
+    /// let decl = b.let_stmt(pat, Some(one));
+    /// let use_t = b.use_binder(t);
+    /// let original = b.block(&[decl], Some(use_t));
+    /// let NodeRef::Expr(copy) = b.copy_subtree(NodeRef::Expr(original)) else { unreachable!() };
+    /// let pair = b.list(&[original, copy]);
+    /// let both = b.expr(Expr::Tuple(pair));
+    /// let body = b.block(&[], Some(both));
+    /// let f = b.func(Name::new(names.intern("f")), &[], body);
+    /// let root = b.module(None, &[f]);
+    /// let hir = b.finish(root)?;
+    /// assert_eq!(hir.count(hir_lang::IdKind::Binder), 2);
+    /// # Ok::<(), hir_lang::HirError>(())
+    /// ```
+    pub fn copy_subtree(&mut self, node: NodeRef) -> NodeRef {
+        match crate::copy::copy_subtree(&mut self.store, &mut self.attrs, node) {
+            Some(copy) => copy,
+            None => {
+                self.overflow = Some(Capacity::Pool);
+                node
+            }
+        }
     }
 
     // ----------------------------------------------------------- finish
@@ -903,10 +1017,10 @@ impl Builder {
     /// # Examples
     ///
     /// ```
-    /// use hir_lang::{Builder, Expr, HirError, NodeRef};
+    /// use hir_lang::{Builder, HirError, NodeRef};
     ///
     /// let mut b = Builder::new();
-    /// let orphan = b.expr(Expr::Err);
+    /// let orphan = b.int(1); // never attached to the tree
     /// let root = b.module(None, &[]);
     /// assert_eq!(b.finish(root), Err(HirError::Unreachable { node: NodeRef::Expr(orphan) }));
     /// ```
@@ -915,8 +1029,70 @@ impl Builder {
             return Err(HirError::CapacityExceeded { what });
         }
         self.normalize_attrs();
-        let index = validate(&self.store, root)?;
-        Ok(Hir::from_parts(self.store, root, index))
+        let ctx = Ctx {
+            unit: self.unit,
+            tag: self.tag,
+        };
+        let index = validate(&self.store, root, ctx)?;
+        Ok(Hir::from_parts(
+            self.store, root, self.unit, self.tag, index,
+        ))
+    }
+
+    /// Validates leniently: every problem is collected, each offending node
+    /// is replaced by its kind's error form (or a narrower fix: an error
+    /// resolution, a wildcard binding), and the repaired, valid `Hir` is
+    /// returned with every problem in source order.
+    ///
+    /// This is the mode for user code: a `break` outside a loop, an `await`
+    /// outside an async function, a duplicate field or named argument, an
+    /// out-of-range literal, or an out-of-scope reference becomes a
+    /// diagnostic, and the rest of the unit is still analyzed. Consequences
+    /// of a repair (children of a replaced node, references to binders it
+    /// bound) are fixed silently, not reported again. Use [`finish`](Self::finish)
+    /// in tools that must reject any malformed HIR.
+    ///
+    /// # Errors
+    ///
+    /// Only where no repair exists: [`HirError::CapacityExceeded`], a root
+    /// that does not exist ([`HirError::Dangling`]), or one that is not a
+    /// module ([`HirError::RootNotModule`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, Expr, HirError, IntLit, JumpProblem, Lit, Prim};
+    ///
+    /// let mut b = Builder::new();
+    /// let stray = b.expr(Expr::Break { label: None, value: None });
+    /// let big = b.lit(Lit::Int(IntLit::new(300).with_suffix(Prim::U8)));
+    /// let s1 = b.expr_stmt(stray);
+    /// let s2 = b.expr_stmt(big);
+    /// let body = b.block(&[s1, s2], None);
+    /// let f = b.func(hir_lang::Name::new(intern_lang::Interner::new().intern("f")), &[], body);
+    /// let root = b.module(None, &[f]);
+    ///
+    /// let (hir, problems) = b.finish_lenient(root)?;
+    /// assert_eq!(problems.len(), 2);
+    /// assert!(problems.contains(&HirError::Jump { expr: stray, problem: JumpProblem::BreakOutsideLoop }));
+    /// assert_eq!(hir.expr(stray), &Expr::Err);
+    /// assert_eq!(hir.validate(), Ok(()));
+    /// # Ok::<(), HirError>(())
+    /// ```
+    pub fn finish_lenient(mut self, root: ItemId) -> Result<(Hir, Vec<HirError>), HirError> {
+        if let Some(what) = self.overflow {
+            return Err(HirError::CapacityExceeded { what });
+        }
+        self.normalize_attrs();
+        let ctx = Ctx {
+            unit: self.unit,
+            tag: self.tag,
+        };
+        let (index, problems) = validate_lenient(&mut self.store, root, ctx)?;
+        Ok((
+            Hir::from_parts(self.store, root, self.unit, self.tag, index),
+            problems,
+        ))
     }
 
     /// Sorts the attribute table by target, merging several lists for one target

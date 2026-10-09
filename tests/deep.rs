@@ -32,6 +32,7 @@ fn exercise(hir: &Hir, names: &Interner, expected_nodes: usize) {
                 max_depth = max_depth.max(depth);
             }
             hir_lang::Event::Leave(_) => depth -= 1,
+            _ => {}
         }
         Control::Continue
     });
@@ -221,6 +222,8 @@ fn test_deep_closure_nesting_captures_through_every_level() {
             effects: Effects::NONE,
             implicit: Some(CaptureMode::Infer),
             captures: List::EMPTY,
+            self_binder: None,
+            defaults: hir_lang::DefaultEval::PerCall,
         }));
         innermost.get_or_insert(e);
     }
@@ -247,6 +250,8 @@ fn test_deep_closure_nesting_without_implicit_captures_is_rejected() {
             // The outermost closure forbids implicit captures.
             implicit: (i + 1 < DEEP / 4).then_some(CaptureMode::Infer),
             captures: List::EMPTY,
+            self_binder: None,
+            defaults: hir_lang::DefaultEval::PerCall,
         }));
     }
     let body = b.block(&[], Some(e));

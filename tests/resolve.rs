@@ -90,12 +90,14 @@ fn test_resolve_rejects_every_kind_of_bad_resolution_without_changing_the_path()
         Err(HirError::Dangling { .. })
     ));
     // A function item may be named from a value path; a module may not.
-    assert!(hir.resolve(here, Res::Item(f)).is_ok());
+    let f_def = hir.def(hir_lang::Def::Item(f));
+    let root_def = hir.def(hir_lang::Def::Item(hir.root()));
+    assert!(hir.resolve(here, Res::Def(f_def)).is_ok());
     assert!(matches!(
-        hir.resolve(here, Res::Item(hir.root())),
+        hir.resolve(here, Res::Def(root_def)),
         Err(HirError::Resolution { .. })
     ));
-    assert_eq!(hir.path(here).res, Res::Item(f));
+    assert_eq!(hir.path(here).res, Res::Def(f_def));
     assert!(!hir.can_reference(nested_path, p));
 }
 
@@ -292,6 +294,8 @@ fn test_explicit_captures_rebind_inside_and_are_excluded_from_implicit() {
         effects: Effects::NONE,
         implicit: Some(CaptureMode::ByValue),
         captures,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let body = k.b.block(&[], Some(c));
     let f = k.func_fx("f", &[pt, ps], Effects::NONE, body);
@@ -325,6 +329,8 @@ fn test_explicit_capture_of_out_of_scope_variable_is_rejected() {
         effects: Effects::NONE,
         implicit: None,
         captures,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let body = k.b.block(&[s_blk], Some(c));
     assert!(matches!(
@@ -415,6 +421,8 @@ fn test_labels_do_not_cross_closures() {
         effects: Effects::NONE,
         implicit: Some(CaptureMode::Infer),
         captures: List::EMPTY,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let lp = k.b.expr(Expr::Loop {
         label: Some(l),
@@ -431,8 +439,8 @@ fn test_labels_do_not_cross_closures() {
 }
 
 #[test]
-fn test_loop_step_continue_and_labeled_block_break_are_valid() {
-    // 'blk: { loop [step: continue] { if c { break 'blk 1 } else { continue } } }
+fn test_loop_step_break_and_labeled_block_break_are_valid() {
+    // 'blk: { loop [step: break] { if c { break 'blk 1 } else { continue } } }
     let mut k = Kit::new();
     let blk_label = k.binder("blk", BinderKind::Label);
     let one = k.b.int(1);
@@ -447,7 +455,12 @@ fn test_loop_step_continue_and_labeled_block_break_are_valid() {
         then: br,
         else_: Some(cont),
     });
-    let step = k.b.expr(Expr::Continue { label: None });
+    // `break` may leave a loop from its step; `continue` may not (it would
+    // re-run the step).
+    let step = k.b.expr(Expr::Break {
+        label: None,
+        value: None,
+    });
     let lp = k.b.expr(Expr::Loop {
         label: None,
         body: iff,

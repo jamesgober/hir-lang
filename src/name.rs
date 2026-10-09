@@ -1,13 +1,17 @@
 //! Binders, paths, namespaces, and resolutions.
 
+use intern_lang::Symbol;
+
 use crate::{
-    id::{BinderId, ItemId, List, TyId, VariantId},
+    def::DefId,
+    id::{BinderId, List, TyId},
     lit::Prim,
     origin::{Name, Origin},
+    ty::GenericArg,
 };
 
-/// What a binder names. Each kind has exactly one kind of binding site; see the
-/// spec, §3.1.
+/// What a binder names. Each kind has its own binding sites; see the spec,
+/// §3.1.
 ///
 /// # Examples
 ///
@@ -18,13 +22,15 @@ use crate::{
 /// assert!(BinderKind::TypeParam.is_type_level());
 /// assert!(!BinderKind::Label.is_value());
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BinderKind {
-    /// A local variable bound by a `let` or arm pattern.
+    /// A local variable: bound by a `let`, an arm pattern, a `static` or
+    /// `global` declaration.
     Local,
     /// A parameter bound by a parameter pattern.
     Param,
-    /// A closure-local variable bound by an explicit capture.
+    /// A closure-local variable: bound by an explicit capture or as a
+    /// closure's self binder.
     Capture,
     /// A generic type parameter.
     TypeParam,
@@ -66,6 +72,27 @@ impl BinderKind {
     #[must_use]
     pub const fn is_type_level(self) -> bool {
         matches!(self, Self::TypeParam | Self::ConstParam | Self::Region)
+    }
+
+    /// Returns the namespace a path naming this binder is in, or `None` for
+    /// labels (which are never named by paths).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{BinderKind, Ns};
+    ///
+    /// assert_eq!(BinderKind::ConstParam.ns(), Some(Ns::Value));
+    /// assert_eq!(BinderKind::Label.ns(), None);
+    /// ```
+    #[must_use]
+    pub const fn ns(self) -> Option<Ns> {
+        match self {
+            Self::Local | Self::Param | Self::Capture | Self::ConstParam => Some(Ns::Value),
+            Self::TypeParam => Some(Ns::Type),
+            Self::Region => Some(Ns::Region),
+            Self::Label => None,
+        }
     }
 
     /// Returns the kind's spelling, as the printer and errors use it.
@@ -158,7 +185,7 @@ impl Binder {
     }
 }
 
-/// The namespace a path is looked up in, fixed by the path's parent node.
+/// The namespace a path is looked up in, fixed by the path's context.
 ///
 /// # Examples
 ///
@@ -167,15 +194,15 @@ impl Binder {
 ///
 /// assert_eq!(Ns::Value.name(), "value");
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ns {
-    /// Expression paths and capture sources.
+    /// Expression paths, capture sources, `global` declarations.
     Value,
     /// Type paths and the paths of record expressions/patterns.
     Type,
-    /// Constructor and constant paths in patterns.
+    /// Constructor, constant, and identifier paths in patterns.
     Pattern,
-    /// Explicit regions in reference types.
+    /// Explicit regions in reference types, bounds, and generic arguments.
     Region,
     /// Import paths.
     Import,
@@ -203,8 +230,8 @@ impl Ns {
     }
 }
 
-/// What a path refers to. Lowering may set it; resolve-lang sets the rest with
-/// [`Hir::resolve`](crate::Hir::resolve).
+/// What a path (or its resolved prefix) refers to. Lowering may set it;
+/// resolve-lang sets the rest with [`Hir::resolve`](crate::Hir::resolve).
 ///
 /// # Examples
 ///
@@ -221,12 +248,13 @@ pub enum Res {
     Unresolved,
     /// A binder: a local, parameter, capture, or generic parameter.
     Local(BinderId),
-    /// An item.
-    Item(ItemId),
-    /// A sum variant.
-    Variant(VariantId),
+    /// An item or variant, in this unit or another.
+    Def(DefId),
     /// A primitive type.
     Prim(Prim),
+    /// A host or standard-library symbol bound by the language's `[stdlib]`
+    /// table (resolved by host-lang, not by HIR).
+    Extern(Symbol),
     /// Resolution failed and was reported; consumers suppress cascades.
     Err,
 }
@@ -247,13 +275,86 @@ impl Res {
     }
 }
 
+/// Where a path starts.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::PathRoot;
+///
+/// assert_eq!(PathRoot::default(), PathRoot::Relative);
+/// assert!(PathRoot::StaticType.is_type_root());
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PathRoot {
+    /// Looked up from the current scope.
+    #[default]
+    Relative,
+    /// `::a` — from the root module of the package.
+    Global,
+    /// `self::a` (Rust) — from the current module.
+    SelfModule,
+    /// `super::a`, `super::super::a` — from an enclosing module, this many
+    /// levels up (at least 1).
+    Super(u8),
+    /// `Self::a` (Rust), `self::a` (PHP) — relative to the enclosing
+    /// impl/interface/class type.
+    SelfType,
+    /// `parent::a` (PHP) — relative to the enclosing class's base class.
+    ParentType,
+    /// `static::a` (PHP) — relative to the run-time class (late static
+    /// binding).
+    StaticType,
+}
+
+impl PathRoot {
+    /// Returns `true` for the roots that start at a type (`Self`, `parent`,
+    /// `static`), whose tails may be resolved by type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::PathRoot;
+    ///
+    /// assert!(PathRoot::ParentType.is_type_root());
+    /// assert!(!PathRoot::Global.is_type_root());
+    /// ```
+    #[must_use]
+    pub const fn is_type_root(self) -> bool {
+        matches!(self, Self::SelfType | Self::ParentType | Self::StaticType)
+    }
+}
+
+/// A qualified self type: `<T>::a` or `<T as Tr>::a`.
+///
+/// The first `trait_len` segments of the path name the trait (none for
+/// `<T>::a`); the rest are resolved relative to `ty` (by typeck).
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{Builder, QSelf, Ty};
+///
+/// let mut b = Builder::new();
+/// let t = b.ty(Ty::SelfTy);
+/// let q = QSelf { ty: t, trait_len: 1 };
+/// assert_eq!(q.trait_len, 1);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QSelf {
+    /// The self type.
+    pub ty: TyId,
+    /// How many leading segments name the trait.
+    pub trait_len: u32,
+}
+
 /// One segment of a path: a hygienic name, its generic arguments, and its own
 /// origin (what an LSP renames).
 ///
 /// # Examples
 ///
 /// ```
-/// use hir_lang::{List, Name, Origin, Segment};
+/// use hir_lang::{Name, Origin, Segment};
 /// use intern_lang::Interner;
 ///
 /// let mut names = Interner::new();
@@ -264,8 +365,8 @@ impl Res {
 pub struct Segment {
     /// The name.
     pub name: Name,
-    /// Generic arguments (`Vec::<T>`); constants appear as `Ty::Const`.
-    pub args: List<TyId>,
+    /// Generic arguments (`Vec::<T>`, `Iterator<Item = u8>`, `Ref<'a>`).
+    pub args: List<GenericArg>,
     /// The segment's own origin.
     pub origin: Origin,
 }
@@ -293,29 +394,57 @@ impl Segment {
     }
 }
 
-/// A name reference: segments, its namespace, and its resolution slot.
+/// A name reference: root, optional qualified self, segments, namespace, and
+/// a partial resolution.
+///
+/// `res` names what the first `segments.len() - unresolved` segments refer to
+/// (the resolved prefix); the remaining `unresolved` segments are resolved by
+/// type (associated items, `Vec::new`, `T::Item`). A path with no segments and
+/// `res: Err` is the error path.
 ///
 /// # Examples
 ///
 /// ```
-/// use hir_lang::{Builder, Name, Ns, Path, Res};
-/// use intern_lang::Interner;
+/// use hir_lang::{List, Ns, Path, PathRoot, Res};
 ///
-/// let mut names = Interner::new();
-/// let mut b = Builder::new();
-/// let path = b.name_path(Name::new(names.intern("print")), Ns::Value);
-/// let _ = path;
-/// let p = Path { segments: hir_lang::List::EMPTY, ns: Ns::Type, res: Res::Unresolved, global: false };
-/// assert_eq!(p.ns, Ns::Type);
+/// let p = Path::new(List::EMPTY, Ns::Type);
+/// assert_eq!((p.root, p.res, p.unresolved), (PathRoot::Relative, Res::Unresolved, 0));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Path {
-    /// The segments (at least one).
+    /// The segments (at least one, except for the error path).
     pub segments: List<Segment>,
-    /// The namespace, which must match the path's parent.
+    /// The namespace, which must match the path's context.
     pub ns: Ns,
-    /// What the path refers to.
+    /// Where lookup starts.
+    pub root: PathRoot,
+    /// `<T>::…` or `<T as Tr>::…`.
+    pub qself: Option<QSelf>,
+    /// What the resolved prefix refers to.
     pub res: Res,
-    /// A leading `::` (resolve from the root, not the current scope).
-    pub global: bool,
+    /// How many trailing segments are left to type-directed resolution.
+    pub unresolved: u32,
+}
+
+impl Path {
+    /// An unresolved relative path.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{List, Ns, Path};
+    ///
+    /// assert!(Path::new(List::EMPTY, Ns::Value).qself.is_none());
+    /// ```
+    #[must_use]
+    pub const fn new(segments: List<Segment>, ns: Ns) -> Self {
+        Self {
+            segments,
+            ns,
+            root: PathRoot::Relative,
+            qself: None,
+            res: Res::Unresolved,
+            unresolved: 0,
+        }
+    }
 }

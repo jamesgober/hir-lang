@@ -23,10 +23,8 @@ pub fn kitchen_sink() -> (Hir, intern_lang::Interner) {
     let seg_io = hir_lang::Segment::new(io, k.b.origin());
     let segs = k.b.list(&[seg_std, seg_io]);
     let io_path = k.b.path(hir_lang::Path {
-        segments: segs,
-        ns: Ns::Import,
-        res: Res::Unresolved,
-        global: true,
+        root: hir_lang::PathRoot::Global,
+        ..hir_lang::Path::new(segs, Ns::Import)
     });
     let import_io = k.b.item(Item::new(
         Some(io),
@@ -212,7 +210,8 @@ pub fn kitchen_sink() -> (Hir, intern_lang::Interner) {
     let show_path = k.b.name_path(show_ref, Ns::Type);
     let show_ty = k.b.ty(Ty::Path(show_path));
     let point_ref = k.name("Point");
-    let point_path = k.b.resolved_path(point_ref, Ns::Type, Res::Item(point));
+    let point_def = k.b.def(hir_lang::Def::Item(point));
+    let point_path = k.b.resolved_path(point_ref, Ns::Type, Res::Def(point_def));
     let point_ty = k.b.ty(Ty::Path(point_path));
     let impl_items = k.b.list(&[show_impl, n_impl, out_impl]);
     let imp = k.b.item(Item::new(
@@ -289,6 +288,7 @@ pub fn kitchen_sink() -> (Hir, intern_lang::Interner) {
     let inner_mod = k.b.module(Some(inner_name), &[]);
 
     let main = main_fn(&mut k);
+    let extras = new_forms(&mut k);
 
     let root_name = k.name("app");
     let root = k.b.module(
@@ -305,6 +305,10 @@ pub fn kitchen_sink() -> (Hir, intern_lang::Interner) {
             alias,
             inner_mod,
             main,
+            extras.0,
+            extras.1,
+            extras.2,
+            extras.3,
         ],
     );
     let inline = k.ident("inline");
@@ -347,8 +351,11 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
     let u_name = k.name("U");
     let u_path = k.b.resolved_path(u_name, Ns::Type, Res::Local(u));
     let u_ty = k.b.ty(Ty::Path(u_path));
-    let bounds = k.b.list(&[show_bound]);
-    let preds = k.b.list(&[WherePred { ty: u_ty, bounds }]);
+    let bounds = k.b.list(&[hir_lang::Bound::Ty(show_bound)]);
+    let preds = k.b.list(&[WherePred {
+        subject: hir_lang::Bound::Ty(u_ty),
+        bounds,
+    }]);
     let params_g = k.b.list(&[
         GenericParam::new(u),
         GenericParam {
@@ -540,6 +547,8 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
         effects: Effects::ASYNC,
         implicit: Some(CaptureMode::Infer),
         captures,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let spawn = k.b.expr(Expr::Spawn(closure));
     let awaited = k.b.expr(Expr::Await(spawn));
@@ -573,7 +582,7 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
     // obj.method::<i32>(1, level = 2, ...xs, **kw); Point { x: 1, ..base }; [k => v, 1]; [1, 2]
     let x_recv = k.b.use_binder(x);
     let i32_arg = k.b.ty(Ty::Prim(Prim::I32));
-    let generic_args = k.b.list(&[i32_arg]);
+    let generic_args = k.b.list(&[hir_lang::GenericArg::Ty(i32_arg)]);
     let (a1, a2, a3, a4) = (k.b.int(1), k.b.int(2), k.b.int(3), k.b.int(4));
     let level = k.ident("level");
     let args = k.b.list(&[
@@ -581,14 +590,17 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
         Arg {
             kind: ArgKind::Named(level),
             value: a2,
+            place: false,
         },
         Arg {
             kind: ArgKind::Spread,
             value: a3,
+            place: false,
         },
         Arg {
             kind: ArgKind::SpreadNamed,
             value: a4,
+            place: false,
         },
     ]);
     let method = k.ident("method");
@@ -660,6 +672,7 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
         ret: i32r,
         effects: Effects::THROWS,
         throws: Some(strt),
+        abi: None,
     });
     let u8t = k.b.ty(Ty::Prim(Prim::U8));
     let slice_t = k.b.ty(Ty::Slice(u8t));
@@ -677,7 +690,7 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
     let show2 = k.name("Show");
     let show2_path = k.b.name_path(show2, Ns::Type);
     let show2_ty = k.b.ty(Ty::Path(show2_path));
-    let objs = k.b.list(&[show2_ty]);
+    let objs = k.b.list(&[hir_lang::Bound::Ty(show2_ty)]);
     let obj = k.b.ty(Ty::Object(objs));
     let never = k.b.ty(Ty::Never);
     let infer = k.b.ty(Ty::Infer);
@@ -686,12 +699,12 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
     let m_len = k.b.resolved_path(m_name, Ns::Value, Res::Local(m));
     let len = k.b.expr(Expr::Path(m_len));
     let arr_t = k.b.ty(Ty::Array { elem: u8e, len });
-    let four = k.b.int(4);
-    let const_arg = k.b.ty(Ty::Const(four));
+    let impl_bound = show_bound2(k);
+    let impls = k.b.list(&[hir_lang::Bound::Ty(impl_bound)]);
+    let impl_t = k.b.ty(Ty::Impl(impls));
     let err_t = k.b.ty(Ty::Err);
-    let all = k.b.list(&[
-        fn_ty, ref_t, ptr, obj, never, infer, arr_t, const_arg, err_t,
-    ]);
+    let all =
+        k.b.list(&[fn_ty, ref_t, ptr, obj, never, infer, arr_t, impl_t, err_t]);
     let all_ty = k.b.ty(Ty::Tuple(all));
     let w = k.b.pat(Pat::Wild);
     stmts.push(k.b.stmt(Stmt::Let {
@@ -723,10 +736,468 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
                 throws: None,
                 abi: None,
                 body: Some(body),
+                defaults: hir_lang::DefaultEval::PerCall,
             }),
         )
         .with_vis(Vis::Public),
     )
+}
+
+fn show_bound2(k: &mut Kit) -> hir_lang::TyId {
+    let show = k.name("Show");
+    let p = k.b.name_path(show, Ns::Type);
+    k.b.ty(Ty::Path(p))
+}
+
+/// The 0.3 forms: units and partial paths, generic-argument bindings and
+/// constraints, region bounds, unions, mixins, protected members, by-ref
+/// parameters and place arguments, reference assignment, dynamic members,
+/// variable variables, append, `static`/`global`, identifier patterns,
+/// recursive closures, evaluate-once defaults, asm, intrinsics, and a module
+/// body.
+#[allow(clippy::too_many_lines)]
+fn new_forms(
+    k: &mut Kit,
+) -> (
+    hir_lang::ItemId,
+    hir_lang::ItemId,
+    hir_lang::ItemId,
+    hir_lang::ItemId,
+) {
+    use hir_lang::{
+        Asm, AsmDir, AsmOperand, AsmOptions, Bound, ClassDef, DefaultEval, GenericArg, Intrinsic,
+        MemOrder, MixinAction, MixinRule, MixinUseDef, PathRoot, QSelf, RecordDef,
+    };
+    // union Bits { i: u32, f: f32 }
+    let fi = k.ident("i");
+    let u32_ty = k.b.ty(Ty::Prim(Prim::U32));
+    let f_i = k.b.field(FieldDef {
+        ty: Some(u32_ty),
+        ..FieldDef::named(fi)
+    });
+    let ff = k.ident("f");
+    let f32_ty = k.b.ty(Ty::Prim(Prim::F32));
+    let f_f = k.b.field(FieldDef {
+        ty: Some(f32_ty),
+        ..FieldDef::named(ff)
+    });
+    let fields = k.b.list(&[f_i, f_f]);
+    let bits_name = k.name("Bits");
+    let bits = k.b.item(Item::new(
+        Some(bits_name),
+        ItemKind::Record(RecordDef {
+            fields,
+            is_union: true,
+            ..RecordDef::default()
+        }),
+    ));
+
+    // mixin Greets { protected fn hello() {} }  class Child : Base, Other { use Greets { hello as public hi } }
+    let hbody = k.b.block(&[], None);
+    let hname = k.name("hello");
+    let hello = k.b.item(
+        Item::new(
+            Some(hname),
+            ItemKind::Fn(FnDef {
+                body: Some(hbody),
+                ..FnDef::default()
+            }),
+        )
+        .with_vis(Vis::Protected),
+    );
+    let mixin_items = k.b.list(&[hello]);
+    let greets_name = k.name("Greets");
+    let greets = k.b.item(Item::new(
+        Some(greets_name),
+        ItemKind::Class(ClassDef {
+            items: mixin_items,
+            mixin: true,
+            ..ClassDef::default()
+        }),
+    ));
+    let g2 = k.name("Greets");
+    let greets_path = k.b.name_path(g2, Ns::Type);
+    let greets_ty = k.b.ty(Ty::Path(greets_path));
+    let mixins = k.b.list(&[greets_ty]);
+    let hello_id = k.ident("hello");
+    let hi_id = k.ident("hi");
+    let rules = k.b.list(&[MixinRule {
+        method: hello_id,
+        from: None,
+        action: MixinAction::Alias {
+            name: Some(hi_id),
+            vis: Some(Vis::Public),
+        },
+    }]);
+    let use_greets = k.b.item(Item::new(
+        None,
+        ItemKind::MixinUse(MixinUseDef { mixins, rules }),
+    ));
+    let base_name = k.name("Base");
+    let base_path = k.b.name_path(base_name, Ns::Type);
+    let base_ty = k.b.ty(Ty::Path(base_path));
+    let other_name = k.name("Other");
+    let other_path = k.b.name_path(other_name, Ns::Type);
+    let other_ty = k.b.ty(Ty::Path(other_path));
+    let bases = k.b.list(&[base_ty, other_ty]);
+    let child_items = k.b.list(&[use_greets]);
+    let child_name = k.name("Child");
+    let child = k.b.item(Item::new(
+        Some(child_name),
+        ItemKind::Class(ClassDef {
+            bases,
+            items: child_items,
+            ..ClassDef::default()
+        }),
+    ));
+
+    // fn mox(&$out, $items, $x = $items) defaults=once { ... }
+    let out_b = k.binder("out", BinderKind::Param);
+    let out_pat = k.b.bind(out_b);
+    let p_out = k.b.param(Param {
+        by_ref: true,
+        ..Param::new(out_pat)
+    });
+    let items_n = k.name("items");
+    let (p_items, items_b) = k.b.local_param(items_n);
+    let mut stmts = Vec::new();
+    // static $count = 0; global $config;
+    let count = k.binder("count", BinderKind::Local);
+    let zero = k.b.int(0);
+    stmts.push(k.b.stmt(Stmt::Static {
+        binder: count,
+        ty: None,
+        init: Some(zero),
+    }));
+    let config = k.binder("config", BinderKind::Local);
+    let config_name = k.name("config");
+    let config_path = k.b.name_path(config_name, Ns::Value);
+    stmts.push(k.b.stmt(Stmt::Global {
+        binder: config,
+        path: config_path,
+    }));
+    // $out[] = $count; $out = &$items; $obj->$name; $obj->$m(&$x); $$name
+    let out_use = k.b.use_binder(out_b);
+    let append = k.b.expr(Expr::Append(out_use));
+    let count_use = k.b.use_binder(count);
+    let push = k.b.expr(Expr::Assign {
+        target: append,
+        op: None,
+        value: count_use,
+    });
+    stmts.push(k.b.expr_stmt(push));
+    let out_use2 = k.b.use_binder(out_b);
+    let items_use = k.b.use_binder(items_b);
+    let alias = k.b.expr(Expr::RefAssign {
+        target: out_use2,
+        source: items_use,
+    });
+    stmts.push(k.b.expr_stmt(alias));
+    let cfg = k.b.use_binder(config);
+    let key = k.b.str_lit("name");
+    let dyn_field = k.b.expr(Expr::DynField {
+        base: cfg,
+        name: key,
+    });
+    stmts.push(k.b.expr_stmt(dyn_field));
+    let cfg2 = k.b.use_binder(config);
+    let mname = k.b.str_lit("run");
+    let arg_place = k.b.use_binder(count);
+    let dargs = k.b.list(&[Arg {
+        kind: ArgKind::Positional,
+        value: arg_place,
+        place: true,
+    }]);
+    let dcall = k.b.expr(Expr::DynMethodCall {
+        receiver: cfg2,
+        name: mname,
+        args: dargs,
+    });
+    stmts.push(k.b.expr_stmt(dcall));
+    let vname = k.b.str_lit("count");
+    let varvar = k.b.expr(Expr::VarVar(vname));
+    stmts.push(k.b.expr_stmt(varvar));
+    // match $count { NONE => 0, n => n }   (identifier patterns)
+    let none_b = k.binder("NONE", BinderKind::Local);
+    let none_name = k.name("NONE");
+    let none_path = k.b.name_path(none_name, Ns::Pattern);
+    let ident = k.b.pat(Pat::Ident {
+        binder: none_b,
+        path: none_path,
+    });
+    let zero2 = k.b.int(0);
+    let n_b = k.binder("n", BinderKind::Local);
+    let n_name = k.name("n");
+    let n_path = k.b.name_path(n_name, Ns::Pattern);
+    let n_pat = k.b.pat(Pat::Ident {
+        binder: n_b,
+        path: n_path,
+    });
+    let n_use = k.b.use_binder(n_b);
+    let arms = k.b.list(&[
+        Arm {
+            pat: ident,
+            guard: None,
+            body: zero2,
+        },
+        Arm {
+            pat: n_pat,
+            guard: None,
+            body: n_use,
+        },
+    ]);
+    let scrut = k.b.use_binder(count);
+    let m = k.b.expr(Expr::Match {
+        scrutinee: scrut,
+        arms,
+    });
+    stmts.push(k.b.expr_stmt(m));
+    // $fact = function ($k) use self { $fact($k) };   (recursive closure)
+    let me = k.binder("fact", BinderKind::Capture);
+    let kn = k.name("k");
+    let (pk, kb) = k.b.local_param(kn);
+    let me_use = k.b.use_binder(me);
+    let k_use = k.b.use_binder(kb);
+    let rec_call = k.b.call(me_use, &[k_use]);
+    let cparams = k.b.list(&[pk]);
+    let fact = k.b.expr(Expr::Closure(Closure {
+        params: cparams,
+        self_binder: Some(me),
+        ..Closure::new(rec_call)
+    }));
+    stmts.push(k.b.expr_stmt(fact));
+    let body = k.b.block(&stmts, None);
+    let x_b = k.binder("x", BinderKind::Param);
+    let x_pat = k.b.bind(x_b);
+    let default = k.b.str_lit("none");
+    let p_x = k.b.param(Param {
+        default: Some(default),
+        ..Param::new(x_pat)
+    });
+    let params = k.b.list(&[p_out, p_items, p_x]);
+    let mox_name = k.name("mox");
+    let mox = k.b.item(Item::new(
+        Some(mox_name),
+        ItemKind::Fn(FnDef {
+            params,
+            body: Some(body),
+            defaults: DefaultEval::Once,
+            effects: Effects::UNSAFE,
+            ..FnDef::default()
+        }),
+    ));
+
+    // fn zero<'r, T: Iterator<Item = u8> + Sum<Out: Show> + 'r>(p: *mut u32) { asm; atomics; <T as Add>::Output; Self-free partial path }
+    let r = k.binder("r", BinderKind::Region);
+    let t = k.binder("T", BinderKind::TypeParam);
+    let it_name = k.name("Iterator");
+    let item_id = k.ident("Item");
+    let u8_ty = k.b.ty(Ty::Prim(Prim::U8));
+    let binding = k.b.list(&[GenericArg::Binding {
+        name: item_id,
+        ty: u8_ty,
+    }]);
+    let it_seg = hir_lang::Segment {
+        args: binding,
+        ..hir_lang::Segment::new(it_name, k.b.origin())
+    };
+    let it_segs = k.b.list(&[it_seg]);
+    let it_path = k.b.path(hir_lang::Path::new(it_segs, Ns::Type));
+    let it_ty = k.b.ty(Ty::Path(it_path));
+    let sum_name = k.name("Sum");
+    let out_id = k.ident("Out");
+    let show_b = show_bound2(k);
+    let out_bounds = k.b.list(&[Bound::Ty(show_b)]);
+    let constraint = k.b.list(&[GenericArg::Constraint {
+        name: out_id,
+        bounds: out_bounds,
+    }]);
+    let sum_seg = hir_lang::Segment {
+        args: constraint,
+        ..hir_lang::Segment::new(sum_name, k.b.origin())
+    };
+    let sum_segs = k.b.list(&[sum_seg]);
+    let sum_path = k.b.path(hir_lang::Path::new(sum_segs, Ns::Type));
+    let sum_ty = k.b.ty(Ty::Path(sum_path));
+    let r_name = k.name("r");
+    let r_path = k.b.resolved_path(r_name, Ns::Region, Res::Local(r));
+    let t_bounds =
+        k.b.list(&[Bound::Ty(it_ty), Bound::Ty(sum_ty), Bound::Region(r_path)]);
+    let gparams = k.b.list(&[
+        GenericParam::new(r),
+        GenericParam {
+            bounds: t_bounds,
+            ..GenericParam::new(t)
+        },
+    ]);
+    let pn = k.name("p");
+    let p_b = k.b.binder(hir_lang::Binder::new(pn, BinderKind::Param));
+    let p_pat = k.b.bind(p_b);
+    let u32b = k.b.ty(Ty::Prim(Prim::U32));
+    let ptr_ty = k.b.ty(Ty::Ptr {
+        mutable: true,
+        inner: u32b,
+    });
+    let p_param = k.b.param(Param {
+        ty: Some(ptr_ty),
+        ..Param::new(p_pat)
+    });
+    let mut zs = Vec::new();
+    // asm!("mov {0}, {1}", out(reg) v, in(reg) 1)
+    let v_b = k.b.binder(
+        hir_lang::Binder::new(k.names.intern("v").into_name(), BinderKind::Local)
+            .with_mutable(true),
+    );
+    let v_pat = k.b.bind(v_b);
+    let zero3 = k.b.int(0);
+    zs.push(k.b.let_stmt(v_pat, Some(zero3)));
+    let v_place = k.b.use_binder(v_b);
+    let one = k.b.int(1);
+    let reg = k.b.text("reg");
+    let reg2 = k.b.text("reg");
+    let ops = k.b.list(&[
+        AsmOperand {
+            dir: AsmDir::Out,
+            constraint: reg,
+            expr: v_place,
+        },
+        AsmOperand {
+            dir: AsmDir::In,
+            constraint: reg2,
+            expr: one,
+        },
+    ]);
+    let template = k.b.text("mov {0}, {1}");
+    let asm = k.b.expr(Expr::Asm(Asm {
+        template,
+        operands: ops,
+        options: AsmOptions::NOSTACK,
+    }));
+    zs.push(k.b.expr_stmt(asm));
+    let p_use = k.b.use_binder(p_b);
+    let one2 = k.b.int(1);
+    let rmw_args = k.b.list(&[p_use, one2]);
+    let rmw = k.b.expr(Expr::Intrinsic {
+        kind: Intrinsic::AtomicRmw(hir_lang::RmwOp::Add, MemOrder::AcqRel),
+        generic_args: List::EMPTY,
+        args: rmw_args,
+    });
+    zs.push(k.b.expr_stmt(rmw));
+    let fence = k.b.expr(Expr::Intrinsic {
+        kind: Intrinsic::Fence(MemOrder::SeqCst),
+        generic_args: List::EMPTY,
+        args: List::EMPTY,
+    });
+    zs.push(k.b.expr_stmt(fence));
+    // <T as Add>::Output, partially resolved: `Add` by name, `Output` by type.
+    let t_name = k.name("T");
+    let t_path = k.b.resolved_path(t_name, Ns::Type, Res::Local(t));
+    let t_ty = k.b.ty(Ty::Path(t_path));
+    let add_name = k.name("Add");
+    let output_name = k.name("Output");
+    let qsegs = k.b.list(&[
+        hir_lang::Segment::new(add_name, k.b.origin()),
+        hir_lang::Segment::new(output_name, k.b.origin()),
+    ]);
+    let qpath = k.b.path(hir_lang::Path {
+        qself: Some(QSelf {
+            ty: t_ty,
+            trait_len: 1,
+        }),
+        ..hir_lang::Path::new(qsegs, Ns::Type)
+    });
+    let q_ty = k.b.ty(Ty::Path(qpath));
+    let w = k.b.pat(Pat::Wild);
+    zs.push(k.b.stmt(Stmt::Let {
+        pat: w,
+        ty: Some(q_ty),
+        init: None,
+        else_: None,
+    }));
+    let zbody = k.b.block(&zs, None);
+    let zparams = k.b.list(&[p_param]);
+    let zero_name = k.name("zero");
+    let zero_fn = k.b.item(Item::new(
+        Some(zero_name),
+        ItemKind::Fn(FnDef {
+            generics: Generics {
+                params: gparams,
+                preds: List::EMPTY,
+            },
+            params: zparams,
+            body: Some(zbody),
+            effects: Effects::UNSAFE,
+            ..FnDef::default()
+        }),
+    ));
+
+    // module script { echo parent::NAME; }   — a module body with a type-rooted path
+    let echo_name = k.name("echo");
+    let echo = k.b.name_expr(echo_name);
+    let pname = k.name("NAME");
+    let psegs = k.b.list(&[hir_lang::Segment::new(pname, k.b.origin())]);
+    let ppath = k.b.path(hir_lang::Path {
+        root: PathRoot::ParentType,
+        ..hir_lang::Path::new(psegs, Ns::Value)
+    });
+    let pexpr = k.b.expr(Expr::Path(ppath));
+    let call = k.b.call(echo, &[pexpr]);
+    let sbody = k.b.block(&[], Some(call));
+    let script_items = k.b.list(&[bits, greets, child, mox]);
+    let script_name = k.name("script");
+    let script = k.b.item(Item::new(
+        Some(script_name),
+        ItemKind::Module {
+            items: script_items,
+            body: Some(sbody),
+            effects: Effects::THROWS,
+        },
+    ));
+    let _ = (MemOrder::Relaxed,);
+    (script, zero_fn, use_free_fn(k), unit_ref_fn(k))
+}
+
+/// A function whose call target resolves partially: `Vec::new()`.
+fn use_free_fn(k: &mut Kit) -> hir_lang::ItemId {
+    let vec_name = k.name("Vec");
+    let new_name = k.name("new");
+    let segs = k.b.list(&[
+        hir_lang::Segment::new(vec_name, k.b.origin()),
+        hir_lang::Segment::new(new_name, k.b.origin()),
+    ]);
+    let path = k.b.path(hir_lang::Path {
+        res: Res::Extern(k.names.intern("std.Vec")),
+        unresolved: 1,
+        ..hir_lang::Path::new(segs, Ns::Value)
+    });
+    let callee = k.b.expr(Expr::Path(path));
+    let call = k.b.call(callee, &[]);
+    let body = k.b.block(&[], Some(call));
+    k.func_fx("make", &[], Effects::NONE, body)
+}
+
+/// A function calling a definition of another unit.
+fn unit_ref_fn(k: &mut Kit) -> hir_lang::ItemId {
+    let other = hir_lang::DefId::foreign(
+        hir_lang::UnitId::new(7),
+        hir_lang::Def::Item(hir_lang::ItemId::from_index(3).unwrap()),
+    );
+    let name = k.name("helper");
+    let path = k.b.resolved_path(name, Ns::Value, Res::Def(other));
+    let callee = k.b.expr(Expr::Path(path));
+    let call = k.b.call(callee, &[]);
+    let body = k.b.block(&[], Some(call));
+    k.func_fx("cross", &[], Effects::NONE, body)
+}
+
+trait IntoName {
+    fn into_name(self) -> hir_lang::Name;
+}
+
+impl IntoName for hir_lang::Symbol {
+    fn into_name(self) -> hir_lang::Name {
+        hir_lang::Name::new(self)
+    }
 }
 
 fn match_arms(k: &mut Kit) -> List<Arm> {
@@ -738,9 +1209,13 @@ fn match_arms(k: &mut Kit) -> List<Arm> {
         guard: None,
         body: b0,
     });
+    let lo = k.b.pat(Pat::Lit(Lit::Int(IntLit::new(1))));
+    let hi_name = k.name("FIVE");
+    let hi_path = k.b.name_path(hi_name, Ns::Pattern);
+    let hi = k.b.pat(Pat::Path(hi_path));
     let range = k.b.pat(Pat::Range {
-        lo: Some(Lit::Int(IntLit::new(1))),
-        hi: Some(Lit::Int(IntLit::new(5))),
+        lo: Some(lo),
+        hi: Some(hi),
         inclusive: true,
     });
     let guard = k.b.lit(Lit::Bool(true));
@@ -1009,7 +1484,11 @@ const SNAPSHOT: &str = r##"(module app
             (lit 0)
             (lit 10))
           (arm
-            (range 1..=5)
+            (range ..=
+              (lo
+                (lit 1))
+              (hi
+                (pat (path FIVE))))
             (guard
               (lit true))
             (lit 11))
@@ -1132,9 +1611,127 @@ const SNAPSHOT: &str = r##"(module app
           (array-type
             (prim u8)
             (use (path M → local M%5)))
-          (const-arg
-            (lit 4))
+          (impl
+            (type (path Show)))
           (error)))
       (return
-        (use (path a → local a%6))))))
+        (use (path a → local a%6)))))
+  (module script throws
+    (record Bits union
+      (field i
+        (prim u32))
+      (field f
+        (prim f32)))
+    (class Greets mixin
+      (fn hello protected
+        (block)))
+    (class Child
+      (bases
+        (type (path Base))
+        (type (path Other)))
+      (mixin-use
+        (type (path Greets))
+        (rule hello as pub hi)))
+    (fn mox defaults=once unsafe
+      (param normal by-ref
+        (bind out%20))
+      (param normal
+        (bind items%21))
+      (param normal
+        (bind x%28)
+        (default
+          (lit "none")))
+      (block
+        (static count%22
+          (lit 0))
+        (global config%23 (path config))
+        (do
+          (assign
+            (append
+              (use (path out → local out%20)))
+            (use (path count → local count%22))))
+        (do
+          (ref-assign
+            (use (path out → local out%20))
+            (use (path items → local items%21))))
+        (do
+          (dyn-field
+            (use (path config → local config%23))
+            (name
+              (lit "name"))))
+        (do
+          (dyn-method
+            (use (path config → local config%23))
+            (name
+              (lit "run"))
+            (arg place
+              (use (path count → local count%22)))))
+        (do
+          (var-var
+            (lit "count")))
+        (do
+          (match
+            (use (path count → local count%22))
+            (arm
+              (ident NONE%24 (path NONE))
+              (lit 0))
+            (arm
+              (ident n%25 (path n))
+              (use (path n → local n%25)))))
+        (do
+          (closure implicit=none self=fact%26
+            (param normal
+              (bind k%27))
+            (call
+              (use (path fact → local fact%26))
+              (use (path k → local k%27)))))))
+    (block
+      (call
+        (use (path echo))
+        (use (path parent::NAME)))))
+  (fn zero unsafe
+    (generic r%29 region)
+    (generic T%30 type-param
+      (type (path Iterator
+          (args 0
+            (binding Item
+              (prim u8)))))
+      (type (path Sum
+          (args 0
+            (constraint Out
+              (type (path Show))))))
+      (path r → local r%29))
+    (param normal
+      (bind p%31)
+      (ptr mut
+        (prim u32)))
+    (block
+      (let
+        (bind v%32)
+        (lit 0))
+      (do
+        (asm "mov {0}, {1}"
+          (out "reg"
+            (use (path v → local v%32)))
+          (in "reg"
+            (lit 1))))
+      (do
+        (intrinsic atomic_rmw add acq_rel
+          (use (path p → local p%31))
+          (lit 1)))
+      (do
+        (intrinsic fence seq_cst))
+      (let
+        (wild)
+        (type (path <qself>::Add::Output
+            (qself
+              (type (path T → local T%30))))))))
+  (fn make
+    (block
+      (call
+        (use (path Vec::new → extern std.Vec +1)))))
+  (fn cross
+    (block
+      (call
+        (use (path helper → item u7:3))))))
 "##;

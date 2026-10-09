@@ -84,8 +84,9 @@ fn test_dangling_binder_in_res_is_rejected() {
 fn test_dangling_res_item_is_rejected() {
     let mut k = Kit::new();
     let name = k.name("f");
-    let path =
-        k.b.resolved_path(name, Ns::Value, Res::Item(ItemId::from_index(77).unwrap()));
+    let ghost =
+        k.b.def(hir_lang::Def::Item(ItemId::from_index(77).unwrap()));
+    let path = k.b.resolved_path(name, Ns::Value, Res::Def(ghost));
     let e = k.b.expr(Expr::Path(path));
     assert!(matches!(
         k.finish_body(e),
@@ -269,13 +270,19 @@ fn test_cycle_detached_from_root_is_unreachable() {
 // --------------------------------------------------------------- binders
 
 #[test]
-fn test_unbound_binder_is_rejected() {
+fn test_unbound_binder_is_allowed_and_never_in_scope() {
     let mut k = Kit::new();
-    let b = k.binder("x", BinderKind::Local);
-    assert_eq!(
-        k.finish_items(&[]),
-        Err(HirError::BinderNotBound { binder: b })
-    );
+    let _unused = k.binder("unused", BinderKind::Local);
+    assert!(k.finish_items(&[]).is_ok());
+
+    // A reference to it is out of scope.
+    let mut k = Kit::new();
+    let x = k.binder("x", BinderKind::Local);
+    let use_x = k.b.use_binder(x);
+    assert!(matches!(
+        k.finish_body(use_x),
+        Err(HirError::OutOfScope { binder, .. }) if binder == x
+    ));
 }
 
 #[test]
@@ -505,6 +512,8 @@ fn test_closure_without_implicit_captures_cannot_see_outer_local() {
         effects: Effects::NONE,
         implicit: None,
         captures: List::EMPTY,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let body = k.b.block(&[], Some(c));
     let f = k.func_fx("f", &[p], Effects::NONE, body);
@@ -615,7 +624,7 @@ fn test_jump_problems_each_reported() {
         })
     );
 
-    // return out of a finally
+    // return out of a finally is allowed: it overrides the pending completion
     let mut k = Kit::new();
     let ret = k.b.expr(Expr::Return(None));
     let body = int(&mut k, 1);
@@ -624,11 +633,35 @@ fn test_jump_problems_each_reported() {
         catches: List::EMPTY,
         finally: Some(ret),
     });
+    assert!(k.finish_body(t).is_ok());
+
+    // return out of a defer is not
+    let mut k = Kit::new();
+    let ret = k.b.expr(Expr::Return(None));
+    let d = k.b.stmt(Stmt::Defer(ret));
+    let blk = k.b.block(&[d], None);
     assert_eq!(
-        k.finish_body(t),
+        k.finish_body(blk),
         Err(HirError::Jump {
             expr: ret,
             problem: JumpProblem::OutOfDefer
+        })
+    );
+
+    // continue inside the loop's own step
+    let mut k = Kit::new();
+    let cont = k.b.expr(Expr::Continue { label: None });
+    let body = k.b.block(&[], None);
+    let lp = k.b.expr(Expr::Loop {
+        label: None,
+        body,
+        step: Some(cont),
+    });
+    assert_eq!(
+        k.finish_body(lp),
+        Err(HirError::Jump {
+            expr: cont,
+            problem: JumpProblem::ContinueInStep
         })
     );
 }
@@ -647,6 +680,8 @@ fn test_break_cannot_cross_closure_boundary() {
         effects: Effects::NONE,
         implicit: Some(CaptureMode::Infer),
         captures: List::EMPTY,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let lp = k.b.expr(Expr::Loop {
         label: None,
@@ -680,6 +715,24 @@ fn test_effect_problems_each_reported() {
         Err(HirError::Effect {
             expr: ret,
             problem: EffectProblem::ReturnOutsideFunction
+        })
+    );
+
+    // yield inside a finally (cleanup can run while the generator is closed)
+    let mut k = Kit::new();
+    let one = int(&mut k, 1);
+    let y = k.b.expr(Expr::Yield(Some(one)));
+    let body = int(&mut k, 0);
+    let t = k.b.expr(Expr::Try {
+        body,
+        catches: List::EMPTY,
+        finally: Some(y),
+    });
+    assert_eq!(
+        k.finish_body_fx(t, Effects::YIELD),
+        Err(HirError::Effect {
+            expr: y,
+            problem: EffectProblem::YieldInCleanup
         })
     );
 
@@ -899,20 +952,32 @@ fn test_pattern_shape_errors() {
     );
 
     let mut k = Kit::new();
+    let lo = k.b.pat(Pat::Lit(Lit::Int(IntLit::new(1))));
+    let hi = k.b.pat(Pat::Lit(Lit::Char('z')));
     let p = k.b.pat(Pat::Range {
-        lo: Some(Lit::Int(IntLit::new(1))),
-        hi: Some(Lit::Char('z')),
+        lo: Some(lo),
+        hi: Some(hi),
         inclusive: true,
     });
     assert_eq!(malformed(finish_with_pat(k, p)), Malformed::RangeBoundKinds);
 
     let mut k = Kit::new();
+    let lo = k.b.pat(Pat::Lit(Lit::Bool(false)));
     let p = k.b.pat(Pat::Range {
-        lo: Some(Lit::Bool(false)),
+        lo: Some(lo),
         hi: None,
         inclusive: false,
     });
     assert_eq!(malformed(finish_with_pat(k, p)), Malformed::RangeBoundKinds);
+
+    let mut k = Kit::new();
+    let lo = k.b.pat(Pat::Wild);
+    let p = k.b.pat(Pat::Range {
+        lo: Some(lo),
+        hi: None,
+        inclusive: false,
+    });
+    assert_eq!(malformed(finish_with_pat(k, p)), Malformed::RangeBound);
 
     let mut k = Kit::new();
     let p = k.b.pat(Pat::Or(List::EMPTY));
@@ -974,12 +1039,7 @@ fn test_let_else_without_init_is_rejected() {
 #[test]
 fn test_empty_path_is_rejected() {
     let mut k = Kit::new();
-    let p = k.b.path(Path {
-        segments: List::EMPTY,
-        ns: Ns::Value,
-        res: Res::Unresolved,
-        global: false,
-    });
+    let p = k.b.path(Path::new(List::EMPTY, Ns::Value));
     let e = k.b.expr(Expr::Path(p));
     assert_eq!(malformed(k.finish_body(e)), Malformed::EmptyPath);
 }
@@ -1123,6 +1183,8 @@ fn test_parameter_rules() {
         effects: Effects::NONE,
         implicit: None,
         captures: List::EMPTY,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     assert_eq!(malformed(k.finish_body(c)), Malformed::ReceiverPlacement);
 
@@ -1216,7 +1278,8 @@ fn test_shape_and_duplicate_member_errors() {
         k.finish_items(&[r]),
         Err(HirError::DuplicateName {
             node: NodeRef::Item(r),
-            name: sym
+            name: sym,
+            index: 1
         })
     );
 
@@ -1272,10 +1335,12 @@ fn test_shape_and_duplicate_member_errors() {
         Arg {
             kind: ArgKind::Named(key),
             value: v1,
+            place: false,
         },
         Arg {
             kind: ArgKind::Named(key),
             value: v2,
+            place: false,
         },
     ]);
     let call = k.b.expr(Expr::Call { callee, args });
@@ -1329,6 +1394,8 @@ fn test_explicit_infer_capture_is_rejected() {
         effects: Effects::NONE,
         implicit: None,
         captures,
+        self_binder: None,
+        defaults: hir_lang::DefaultEval::PerCall,
     }));
     let fbody = k.b.block(&[], Some(c));
     let f = k.func_fx("f", &[p], Effects::NONE, fbody);

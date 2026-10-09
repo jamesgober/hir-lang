@@ -57,6 +57,11 @@ macro_rules! define_id {
                 NonZeroU32::new(raw).map(Self)
             }
 
+            /// An id that never names a node (index `MAX_LEN`, beyond every
+            /// arena): what fallback records point at.
+            #[allow(dead_code)]
+            pub(crate) const DANGLING: Self = Self(NonZeroU32::MAX);
+
             /// Builds an id from an index the caller has bounded by `MAX_LEN`.
             #[inline]
             pub(crate) fn from_raw_index(index: u32) -> Self {

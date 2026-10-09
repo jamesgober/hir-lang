@@ -13,6 +13,105 @@
 
 ---
 
+## [0.3.0] - 2026-10-08
+
+A breaking 0.x revision that closes the design gaps an adversarial review of
+0.2.0 found, while breaking is cheap: compilation units and cross-unit
+definitions, partial (rustc-style) path resolution, lenient validation that
+turns user errors into diagnostics, the PHP/Mox forms, low-level forms
+(unions, atomics, inline assembly), and the scope/frame information a resolver
+needs. The spec (`specs/HIR.md`) is revised to v2 to match; its §9 examples are
+now built, validated, and printed by a test that checks the spec verbatim.
+
+### Breaking
+
+- **Resolutions name definitions through units.** `Res::Item(ItemId)` and
+  `Res::Variant(VariantId)` are replaced by `Res::Def(DefId)`, where
+  `DefId { unit: UnitId, def: Def::Item | Def::Variant }`. Mint this unit's
+  ids with `Builder::def` / `Hir::def`; other units' with `DefId::foreign`.
+  `Res::Extern(Symbol)` is new (host/stdlib symbols).
+- **`Path`** gained `root: PathRoot` (replaces `global: bool`), `qself:
+  Option<QSelf>`, and `unresolved: u32`; build paths with `Path::new(segments,
+  ns)`. `Segment::args` is now `List<GenericArg>` (was `List<TyId>`).
+- **Types.** `Ty::Const` is removed (use `GenericArg::Const`); `Ty::Object`
+  takes `List<Bound>`; `Ty::Fn` gained `abi`. Bounds everywhere are
+  `List<Bound>` (generic parameters, where-predicates, associated types);
+  `WherePred { ty, bounds }` became `WherePred { subject: Bound, bounds }`;
+  `GenericParam::default` is `Option<GenericArg>`.
+- **Patterns.** `Pat::Range` bounds are child patterns (`Option<PatId>`, a
+  literal or constant path) instead of inline literals.
+- **Items.** `ClassDef::base: Option<TyId>` became `bases: List<TyId>`;
+  `ItemKind::Module` gained `body` and `effects`; `FnDef` gained `defaults`;
+  `RecordDef` gained `is_union`; `ClassDef` gained `mixin`; `Param` gained
+  `by_ref`; `Vis` gained `Protected`; `ItemKind::MixinUse` is new.
+- **Expressions.** `Arg` gained `place`; `Closure` gained `self_binder` and
+  `defaults` (use `Closure::new(body)` with struct update);
+  `MethodCall::generic_args` is `List<GenericArg>`; new variants `DynField`,
+  `DynMethodCall`, `VarVar`, `Append`, `RefAssign`, `Asm`, `Intrinsic`; new
+  statements `Stmt::Static` and `Stmt::Global`.
+- **Walk events.** `Event` is `#[non_exhaustive]` and also reports
+  `ScopeOpen`, `ScopeClose`, `Bind`, `FrameOpen(Frame)`, `FrameClose`;
+  matches on `Event` need a wildcard arm.
+- **Errors.** `HirError::BinderNotBound` is removed (unbound binders are now
+  valid); `DuplicateName` gained `index`; `ForeignDef` is new; new
+  `Malformed`, `JumpProblem::ContinueInStep`, and
+  `EffectProblem::YieldInCleanup` problems.
+- **Validity changed.** Jumps out of `finally` are now allowed (they override
+  the pending completion; `defer` still forbids them); dead error-form nodes
+  are allowed; a `continue` inside its own loop's `step`, `yield` inside
+  `defer`/`finally`, `-0` integer literals, compound assignment with a
+  non-arithmetic operator, and or-patterns whose alternatives bind with
+  different modes are now rejected.
+- **Accessors.** `Hir::param` returns `&Param` (was `Option`), like the other
+  total accessors; foreign ids are a `debug_assert!` failure in debug builds.
+
+### Added
+
+- `UnitId`, `Builder::for_unit`, `Builder::unit`, `Hir::unit`; tagged
+  `DefId`s that a different `Hir` of the same unit rejects (`ForeignDef`).
+- Partial resolution: `Hir::resolve_partial(path, res, unresolved)`, path
+  roots (`::`, `self::`, `super::`, `Self::`, `parent::`, `static::`), and
+  qualified selves (`<T as Tr>::Out`).
+- `Builder::finish_lenient`: collects every problem, repairs each node to its
+  error form (or a narrower fix), suppresses cascades, and returns a valid
+  `Hir` with the problems in source order. `HirError::node()`.
+- `Hir::lookup_local` (innermost in-scope binder by name, O(log n + d)) and
+  scope/binder/frame walk events.
+- `Hir::get_*` accessors returning `Option`, and
+  `Hir::all_implicit_captures` (every closure in one walk).
+- `Builder::copy_subtree`: subtree copy with fresh binders for everything
+  bound inside.
+- PHP/Mox forms: by-reference parameters and place arguments, reference
+  assignment, `static`/`global` locals, dynamic members and calls,
+  variable-variables, append places, class `bases`, traits (`mixin` classes
+  and `MixinUse` with `insteadof`/`as` rules), `protected`.
+- Low-level forms: unions, function-type ABIs, `Intrinsic` (atomics with C++20
+  memory-order checks, fences, volatile, `Named`), structured inline
+  assembly (`Asm` with template placeholder checks).
+- Generic arguments: associated-type bindings and constraints, regions;
+  `Ty::Impl`; region bounds.
+- `Pat::Ident` (binding-or-constant, decided by resolve-lang), recursive
+  closures (`self_binder`), parameter defaults in their own frame with
+  `DefaultEval::Once` for Python, module bodies with effects.
+- Tests: `tests/features.rs` (0.3 forms and APIs), `tests/spec_examples.rs`
+  (spec §9 examples, checked verbatim against the spec), lenient-mode
+  property tests (always valid, agrees with strict).
+
+### Changed
+
+- Spec `specs/HIR.md` v2: units, partial resolution, lenient validation,
+  finally/generator semantics (throw-into, close, async generators) and the
+  LSB mapping, the corrected effects claim (declared effects do not bound
+  run-time failures), the body-graph design for NLL with unwind edges for
+  every fallible operation (implementation stays in 0.5), the encoding's
+  symbol table, HQL's plan-target split, and corrected §9 examples.
+- `implicit_captures` is linear in the closure (was O(n · depth)); duplicate
+  and or-pattern checks use stamp arrays instead of per-construct vectors.
+- `Pat` shrank from 56 to 32 bytes; `Path` grew from 20 to 40 bytes and `Ty`
+  from 20 to 24 (`Expr` stays 40, `Item` 72).
+
+---
+
 ## [0.2.0] - 2026-10-08
 
 The foundation: the HIR data model of the LexerSketch spec (`specs/HIR.md`
@@ -90,6 +189,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/hir-lang/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/hir-lang/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/hir-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/hir-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/hir-lang/releases/tag/v0.1.0

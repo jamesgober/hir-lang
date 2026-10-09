@@ -2,9 +2,12 @@
 
 use core::fmt;
 
+use intern_lang::Symbol;
+
 use crate::{
     id::{ExprId, List, PathId, TyId},
     lit::Prim,
+    origin::Ident,
 };
 
 /// The effects a function, closure, or function type may perform.
@@ -127,7 +130,7 @@ pub enum Ty {
     Path(PathId),
     /// A tuple; the empty tuple is the unit type.
     Tuple(List<TyId>),
-    /// A fixed-length array; `len` is a constant context.
+    /// A fixed-length array; `len` is an integer constant context.
     Array {
         /// Element type.
         elem: TyId,
@@ -162,19 +165,78 @@ pub enum Ty {
         effects: Effects,
         /// The thrown type, if the language types its exceptions.
         throws: Option<TyId>,
+        /// A foreign calling convention (`extern "C" fn`).
+        abi: Option<Symbol>,
     },
     /// `T?`: the type or null.
     Nullable(TyId),
     /// The gradual dynamic type.
     Any,
-    /// An interface (trait) object: `dyn A + B`.
-    Object(List<TyId>),
+    /// An interface (trait) object: `dyn A + B + 'r`.
+    Object(List<Bound>),
+    /// An opaque type known only by its bounds: `impl A + B`.
+    Impl(List<Bound>),
     /// The type of expressions that never complete.
     Never,
     /// `Self` inside an interface, impl, or class.
     SelfTy,
-    /// A constant expression in generic-argument position (a constant context).
-    Const(ExprId),
     /// A type that failed to lower.
     Err,
+}
+
+/// A term in bound position: an interface type or a region.
+///
+/// Used by generic-parameter bounds, `where` predicates, associated-type
+/// bounds, `dyn` and `impl` types, and associated-type constraints.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{Bound, Builder, Ty};
+///
+/// let mut b = Builder::new();
+/// let any = b.ty(Ty::Any);
+/// assert_eq!(Bound::Ty(any), Bound::Ty(any));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Bound {
+    /// An interface (or, as a `where` subject, any type).
+    Ty(TyId),
+    /// A region (`'a`, a `Region`-namespace path).
+    Region(PathId),
+}
+
+/// A generic argument in a path segment or method call.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::{Builder, GenericArg, Prim, Ty};
+///
+/// let mut b = Builder::new();
+/// let int = b.ty(Ty::Prim(Prim::I32));
+/// assert!(matches!(GenericArg::Ty(int), GenericArg::Ty(_)));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GenericArg {
+    /// A type: `Vec<i32>`.
+    Ty(TyId),
+    /// A constant (an integer constant context): `Array<3>`.
+    Const(ExprId),
+    /// A region: `Ref<'a>`.
+    Region(PathId),
+    /// An associated-type binding: `Iterator<Item = u8>`.
+    Binding {
+        /// The associated type.
+        name: Ident,
+        /// Its value.
+        ty: TyId,
+    },
+    /// An associated-type constraint: `Iterator<Item: Show>`.
+    Constraint {
+        /// The associated type.
+        name: Ident,
+        /// Its bounds.
+        bounds: List<Bound>,
+    },
 }

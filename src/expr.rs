@@ -4,10 +4,11 @@ use span_lang::Span;
 
 use crate::{
     id::{BinderId, ExprId, ItemId, List, ParamId, PatId, PathId, StmtId, TyId},
+    intrinsic::{Asm, Intrinsic},
     lit::Lit,
     ops::{Op, Policy},
     origin::Ident,
-    ty::Effects,
+    ty::{Effects, GenericArg},
 };
 
 /// A block: statements, an optional tail value, an optional label.
@@ -90,6 +91,7 @@ pub enum ArgKind {
 /// let mut b = Builder::new();
 /// let value = b.int(1);
 /// assert_eq!(Arg::positional(value).kind, ArgKind::Positional);
+/// assert!(!Arg::positional(value).place);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Arg {
@@ -97,6 +99,11 @@ pub struct Arg {
     pub kind: ArgKind,
     /// The argument expression.
     pub value: ExprId,
+    /// The argument is passed as a place, so a by-reference parameter of the
+    /// callee (PHP `&$x`) aliases it; the callee (statically, or at run time
+    /// for dynamic calls) decides whether it is taken by reference. `value`
+    /// must be a place expression; not allowed on spreads.
+    pub place: bool,
 }
 
 impl Arg {
@@ -116,6 +123,7 @@ impl Arg {
         Self {
             kind: ArgKind::Positional,
             value,
+            place: false,
         }
     }
 }
@@ -244,6 +252,25 @@ pub struct Capture {
     pub mode: CaptureMode,
 }
 
+/// When parameter defaults are evaluated, and what they can see.
+///
+/// # Examples
+///
+/// ```
+/// use hir_lang::DefaultEval;
+///
+/// assert_eq!(DefaultEval::default(), DefaultEval::PerCall);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DefaultEval {
+    /// At each call, in the callee, with the preceding parameters visible
+    /// (Kotlin, C++, Iron).
+    #[default]
+    PerCall,
+    /// Once, when the function is defined; no parameter is visible (Python).
+    Once,
+}
+
 /// A closure (lambda); see the spec, §8.10.
 ///
 /// # Examples
@@ -254,12 +281,8 @@ pub struct Capture {
 /// let mut b = Builder::new();
 /// let body = b.int(1);
 /// let thunk = Closure {
-///     params: List::EMPTY,
-///     ret: None,
-///     body,
-///     effects: Effects::NONE,
 ///     implicit: Some(CaptureMode::Infer),
-///     captures: List::EMPTY,
+///     ..Closure::new(body)
 /// };
 /// assert_eq!(thunk.body, body);
 /// ```
@@ -277,6 +300,39 @@ pub struct Closure {
     pub implicit: Option<CaptureMode>,
     /// Explicit captures, in order.
     pub captures: List<Capture>,
+    /// A binder (kind `Capture`) naming the closure itself inside its body, for
+    /// recursive closures.
+    pub self_binder: Option<BinderId>,
+    /// When parameter defaults are evaluated.
+    pub defaults: DefaultEval,
+}
+
+impl Closure {
+    /// A closure with no parameters, effects, or captures, that forbids
+    /// implicit captures.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{Builder, Closure};
+    ///
+    /// let mut b = Builder::new();
+    /// let body = b.int(0);
+    /// assert!(Closure::new(body).implicit.is_none());
+    /// ```
+    #[must_use]
+    pub const fn new(body: ExprId) -> Self {
+        Self {
+            params: List::EMPTY,
+            ret: None,
+            body,
+            effects: Effects::NONE,
+            implicit: None,
+            captures: List::EMPTY,
+            self_binder: None,
+            defaults: DefaultEval::PerCall,
+        }
+    }
 }
 
 /// An expression; see the spec, §8. Children are evaluated in the order the
@@ -336,7 +392,7 @@ pub enum Expr {
         /// The method name.
         method: Ident,
         /// Explicit generic arguments (`x.collect::<T>()`).
-        generic_args: List<TyId>,
+        generic_args: List<GenericArg>,
         /// The arguments.
         args: List<Arg>,
     },
@@ -349,6 +405,28 @@ pub enum Expr {
         /// The span of the member name.
         span: Span,
     },
+    /// `base->$name`: a member chosen at run time by a string (Mox).
+    DynField {
+        /// The accessed value.
+        base: ExprId,
+        /// The member name, evaluated.
+        name: ExprId,
+    },
+    /// `$receiver->$name(args)`: a method chosen at run time (Mox).
+    DynMethodCall {
+        /// The receiver.
+        receiver: ExprId,
+        /// The method name, evaluated.
+        name: ExprId,
+        /// The arguments.
+        args: List<Arg>,
+    },
+    /// `$$name`: the local variable whose name is computed at run time (Mox);
+    /// a place.
+    VarVar(ExprId),
+    /// `base[]`: the slot after the last element, created on write (Mox
+    /// arrays); a place, valid only as a write target.
+    Append(ExprId),
     /// `base[index]`.
     Index {
         /// The indexed value.
@@ -381,6 +459,14 @@ pub enum Expr {
         op: Option<Op>,
         /// The assigned value.
         value: ExprId,
+    },
+    /// `target = &source`: make the place `target` an alias of the place
+    /// `source` (PHP reference assignment).
+    RefAssign {
+        /// The place that becomes an alias.
+        target: ExprId,
+        /// The aliased place.
+        source: ExprId,
     },
     /// `*e`.
     Deref(ExprId),
@@ -452,6 +538,17 @@ pub enum Expr {
     Yield(Option<ExprId>),
     /// Start a task running a zero-parameter callable; evaluates to a handle.
     Spawn(ExprId),
+    /// Inline assembly.
+    Asm(Asm),
+    /// An atomic, volatile, fence, or named backend intrinsic.
+    Intrinsic {
+        /// Which intrinsic.
+        kind: Intrinsic,
+        /// Explicit generic arguments (the accessed type).
+        generic_args: List<GenericArg>,
+        /// The operands.
+        args: List<ExprId>,
+    },
     /// An expression that failed to lower.
     Err,
 }
@@ -487,6 +584,24 @@ pub enum Stmt {
     Item(ItemId),
     /// Run the expression when the enclosing block exits, last-registered first.
     Defer(ExprId),
+    /// `static $x = init;`: a function-static variable, initialized the first
+    /// time the statement runs and kept across calls (PHP, C).
+    Static {
+        /// The variable (kind `Local`), visible in later statements.
+        binder: BinderId,
+        /// The annotation.
+        ty: Option<TyId>,
+        /// The initializer.
+        init: Option<ExprId>,
+    },
+    /// `global $x;`: binds a local that aliases the global variable `path`
+    /// (PHP).
+    Global {
+        /// The local (kind `Local`), visible in later statements.
+        binder: BinderId,
+        /// The global (`Value` namespace).
+        path: PathId,
+    },
     /// A statement that failed to lower.
     Err,
 }

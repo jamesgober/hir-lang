@@ -119,6 +119,34 @@ pub enum Malformed {
     /// integer constant context (array length, const generic argument,
     /// discriminant). `promote` needs a dynamically typed result.
     PromoteOnStaticResult,
+    /// A path's root, qualified self, unresolved count, and resolution do not
+    /// fit together (`super` with depth 0; a qualified self with a non-relative
+    /// root or no item segment; more unresolved segments than segments; an
+    /// empty resolved prefix without a type root or qualified self; a resolved
+    /// prefix that names something without associated items).
+    PathShape,
+    /// A range-pattern bound is not a literal or constant path pattern.
+    RangeBound,
+    /// An integer literal is `-0`; write `0`.
+    NegativeZero,
+    /// An inline-assembly template is not UTF-8, has an unbalanced brace, or
+    /// names an operand that does not exist.
+    AsmTemplate,
+    /// An inline-assembly output operand is not a place, or a `sym` operand is
+    /// not a path.
+    AsmOperand,
+    /// An intrinsic has the wrong number of operands.
+    IntrinsicArity,
+    /// An atomic intrinsic uses a memory ordering it cannot have.
+    MemOrder,
+    /// A `place` argument is not a place expression, or is a spread.
+    PlaceArg,
+    /// An append place (`$a[]`) is used other than as the target of an
+    /// assignment or reference assignment, or as a place argument.
+    AppendContext,
+    /// An or-pattern alternative binds a binder with a different binding mode
+    /// than the first alternative.
+    OrPatternModes,
 }
 
 impl fmt::Display for Malformed {
@@ -159,6 +187,18 @@ impl fmt::Display for Malformed {
             Self::PromoteOnStaticResult => {
                 "the `promote` overflow policy needs a dynamically typed result"
             }
+            Self::PathShape => {
+                "the path's root, qualified self, and resolution do not fit together"
+            }
+            Self::RangeBound => "a range bound must be a literal or a constant path",
+            Self::NegativeZero => "an integer literal is `-0`",
+            Self::AsmTemplate => "the assembly template is malformed or names a missing operand",
+            Self::AsmOperand => "an assembly output must be a place and a `sym` operand a path",
+            Self::IntrinsicArity => "the intrinsic has the wrong number of operands",
+            Self::MemOrder => "the atomic intrinsic cannot use this memory ordering",
+            Self::PlaceArg => "a place argument must be a non-spread place expression",
+            Self::AppendContext => "an append place can only be written to",
+            Self::OrPatternModes => "or-pattern alternatives bind a binder with different modes",
         })
     }
 }
@@ -183,8 +223,10 @@ pub enum JumpProblem {
     LabelNotInScope,
     /// `continue` names a labeled block.
     ContinueToBlock,
-    /// A jump would leave a `defer` or `finally` body.
+    /// A jump would leave a `defer` body (jumps may leave `finally`).
     OutOfDefer,
+    /// `continue` targets the loop whose `step` it is in.
+    ContinueInStep,
 }
 
 impl fmt::Display for JumpProblem {
@@ -194,7 +236,8 @@ impl fmt::Display for JumpProblem {
             Self::ContinueOutsideLoop => "`continue` outside a loop",
             Self::LabelNotInScope => "the label is not an enclosing loop or block",
             Self::ContinueToBlock => "`continue` targets a block, not a loop",
-            Self::OutOfDefer => "a jump would leave a `defer` or `finally` body",
+            Self::OutOfDefer => "a jump would leave a `defer` body",
+            Self::ContinueInStep => "`continue` inside a loop's own step",
         })
     }
 }
@@ -220,6 +263,9 @@ pub enum EffectProblem {
     YieldOutsideGenerator,
     /// `throw` in a frame without `THROWS` and outside a `try` body.
     ThrowNotAllowed,
+    /// `yield` inside a `defer` or `finally` body (cleanup may run while a
+    /// generator is being closed, when it cannot yield).
+    YieldInCleanup,
 }
 
 impl fmt::Display for EffectProblem {
@@ -229,6 +275,7 @@ impl fmt::Display for EffectProblem {
             Self::AwaitOutsideAsync => "`await` outside an async function",
             Self::YieldOutsideGenerator => "`yield` outside a generator",
             Self::ThrowNotAllowed => "`throw` in a function that does not throw, outside `try`",
+            Self::YieldInCleanup => "`yield` inside a `defer` or `finally` body",
         })
     }
 }
@@ -338,12 +385,15 @@ pub enum HirError {
         problem: Malformed,
     },
     /// Two members of one list share a name (fields, variants, named arguments,
-    /// field initializers, field patterns).
+    /// field initializers, field patterns). Reported at the first repetition in
+    /// source order.
     DuplicateName {
         /// The node owning the list.
         node: NodeRef,
         /// The repeated name.
         name: Symbol,
+        /// The position of the repetition in its list.
+        index: u32,
     },
     /// An op instance does not carry exactly the policy fields its op consults
     /// (or a cast does not carry exactly `overflow` and `float_to_int`).
@@ -359,11 +409,6 @@ pub enum HirError {
         expected: usize,
         /// The number of operands given.
         found: usize,
-    },
-    /// A binder is never bound by any binding site.
-    BinderNotBound {
-        /// The binder.
-        binder: BinderId,
     },
     /// A binder is bound by two binding constructs.
     BinderBoundTwice {
@@ -406,6 +451,12 @@ pub enum HirError {
         /// The rejected resolution.
         res: Res,
     },
+    /// A resolution names a definition of this unit through a `DefId` minted
+    /// by a different `Hir` or builder (ids are not portable between `Hir`s).
+    ForeignDef {
+        /// The path.
+        path: PathId,
+    },
     /// A path resolves to a binder that is not in scope where the path is.
     OutOfScope {
         /// The path.
@@ -415,7 +466,8 @@ pub enum HirError {
     },
     /// A path resolves to a binder outside a frame it may not cross: a local of
     /// an enclosing function from a nested item, a local from a constant
-    /// context, or a local from a closure that forbids implicit captures.
+    /// context, a local from a closure that forbids implicit captures, or a
+    /// parameter from a default evaluated once at definition.
     NotCapturable {
         /// The path.
         path: PathId,
@@ -470,9 +522,9 @@ impl fmt::Display for HirError {
                 node.index()
             ),
             Self::Malformed { site, problem } => write!(f, "{site}: {problem}"),
-            Self::DuplicateName { node, name } => write!(
+            Self::DuplicateName { node, name, index } => write!(
                 f,
-                "{} {} has two members named by symbol {}",
+                "{} {}: member {index} repeats the name of an earlier member (symbol {})",
                 node.kind(),
                 node.index(),
                 name.as_u32()
@@ -491,9 +543,6 @@ impl fmt::Display for HirError {
                 "expression {}: the operation takes {expected} operands, {found} given",
                 expr.index()
             ),
-            Self::BinderNotBound { binder } => {
-                write!(f, "binder {} is never bound", binder.index())
-            }
             Self::BinderBoundTwice { binder, node } => write!(
                 f,
                 "binder {} is bound a second time at {} {}",
@@ -529,6 +578,11 @@ impl fmt::Display for HirError {
                 "path {} cannot resolve to {res:?} in its namespace",
                 path.index()
             ),
+            Self::ForeignDef { path } => write!(
+                f,
+                "path {} names this unit through a definition id minted for another HIR",
+                path.index()
+            ),
             Self::OutOfScope { path, binder } => write!(
                 f,
                 "path {} refers to binder {}, which is not in scope there",
@@ -543,6 +597,53 @@ impl fmt::Display for HirError {
             ),
             Self::Jump { expr, problem } => write!(f, "expression {}: {problem}", expr.index()),
             Self::Effect { expr, problem } => write!(f, "expression {}: {problem}", expr.index()),
+        }
+    }
+}
+
+impl HirError {
+    /// Returns the node the problem is about, when it is one (a path's node
+    /// for resolution problems), so a host can find its origin.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{ExprId, HirError, NodeRef};
+    ///
+    /// let e = ExprId::from_index(3).unwrap();
+    /// assert_eq!(HirError::Policy { expr: e }.node(), Some(NodeRef::Expr(e)));
+    /// assert_eq!(HirError::RootNotModule.node(), None);
+    /// ```
+    #[must_use]
+    pub const fn node(&self) -> Option<NodeRef> {
+        match *self {
+            Self::Dangling { site, .. }
+            | Self::ListOutOfBounds { site }
+            | Self::TextOutOfBounds { site }
+            | Self::Malformed { site, .. } => match site {
+                Site::Node(n) | Site::Attrs(n) => Some(n),
+                _ => None,
+            },
+            Self::SharedNode { node }
+            | Self::Unreachable { node }
+            | Self::DuplicateName { node, .. }
+            | Self::BinderBoundTwice { node, .. } => Some(node),
+            Self::Policy { expr }
+            | Self::Arity { expr, .. }
+            | Self::Jump { expr, .. }
+            | Self::Effect { expr, .. } => Some(NodeRef::Expr(expr)),
+            Self::DuplicateBinding { pat, .. } | Self::OrPatternBinders { pat } => {
+                Some(NodeRef::Pat(pat))
+            }
+            Self::PathNamespace { path, .. }
+            | Self::Resolution { path, .. }
+            | Self::ForeignDef { path }
+            | Self::OutOfScope { path, .. }
+            | Self::NotCapturable { path, .. } => Some(NodeRef::Path(path)),
+            Self::CapacityExceeded { .. }
+            | Self::ExpansionOrder { .. }
+            | Self::RootNotModule
+            | Self::BinderKind { .. } => None,
         }
     }
 }

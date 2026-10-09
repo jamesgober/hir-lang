@@ -1,11 +1,14 @@
 # hir-lang &mdash; API Reference
 
 > Complete reference for every public item in `hir-lang`, with examples.
-> **Status: pre-1.0 (0.2.0, Foundation).** The surface is designed for the 1.0
-> path and frozen only after lower-lang, resolve-lang, and typeck-lang have used
-> it end to end (LexerSketch decision D18). The normative definition of HIR is
-> the LexerSketch spec `specs/HIR.md`; this file documents the Rust API that
-> implements it. See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: pre-1.0 (0.3.0).** 0.3 is a breaking revision of 0.2 that closes
+> the design gaps an adversarial review found (units and cross-unit
+> definitions, partial resolution, lenient validation, PHP/Mox forms,
+> low-level forms). The surface is frozen only after lower-lang,
+> resolve-lang, and typeck-lang have used it end to end (LexerSketch decision
+> D18). The normative definition of HIR is the LexerSketch spec
+> `specs/HIR.md`; this file documents the Rust API that implements it. See
+> [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -16,20 +19,22 @@
 - [Quick start](#quick-start)
 - [Concepts](#concepts)
   - [Storage: arenas, ids, lists](#storage-arenas-ids-lists)
+  - [Units and definition ids](#units-and-definition-ids)
   - [Origins and expansions](#origins-and-expansions)
   - [Binders, scopes, and frames](#binders-scopes-and-frames)
   - [Resolution](#resolution)
   - [Operations and policies](#operations-and-policies)
   - [Effects](#effects)
-  - [What the validator checks](#what-the-validator-checks)
+  - [Strict and lenient validation](#strict-and-lenient-validation)
   - [Canonical order](#canonical-order)
 - [`Builder`](#builder)
 - [`Hir`](#hir)
 - [Free functions](#free-functions)
 - [Items](#items)
 - [Expressions and statements](#expressions-and-statements)
+- [Intrinsics and inline assembly](#intrinsics-and-inline-assembly)
 - [Patterns](#patterns)
-- [Types and effect sets](#types-and-effect-sets)
+- [Types, bounds, generic arguments, effect sets](#types-bounds-generic-arguments-effect-sets)
 - [Names, binders, paths](#names-binders-paths)
 - [Literals and primitive types](#literals-and-primitive-types)
 - [Operations](#operations)
@@ -47,30 +52,33 @@
 
 `hir-lang` defines the high-level IR every LexerSketch language lowers into. A
 [`Builder`](#builder) creates nodes bottom-up and stamps each with its origin;
-[`finish`](#builderfinish) validates and returns a [`Hir`](#hir), which can be
-read, walked, printed, and resolved in place.
+[`finish`](#builderfinish--builderfinish_lenient) validates and returns a
+[`Hir`](#hir), which can be read, walked, printed, and resolved in place.
 
 | Item | Kind | Purpose |
 |---|---|---|
-| [`Builder`](#builder) | struct | Creates nodes, lists, text, attributes, expansions; `finish` validates. |
-| [`Hir`](#hir) | struct | A validated HIR: accessors, `resolve`, `can_reference`, `implicit_captures`, walking. |
+| [`Builder`](#builder) | struct | Creates nodes, lists, text, attributes, expansions; copies subtrees; `finish` / `finish_lenient` validate. |
+| [`Hir`](#hir) | struct | A validated HIR of one unit: accessors, `resolve`/`resolve_partial`, `lookup_local`, `can_reference`, implicit captures, walking. |
 | [`walk`](#walk), [`print`](#print), [`print_with`](#print_with), [`print_into`](#print_into) | functions | The Tier-1 traversal and the debug printer. |
+| [`UnitId`](#unitid), [`DefId`](#defid), [`Def`](#def) | types | Compilation units and definitions across units. |
 | [`Item`](#item), [`ItemKind`](#itemkind) and the `*Def` records | types | Declarations. |
 | [`Expr`](#expr), [`Stmt`](#stmt) and their records | enums | Expressions and statements. |
+| [`Intrinsic`](#intrinsic), [`Asm`](#asm) | types | Atomics, volatile, named intrinsics; structured inline assembly. |
 | [`Pat`](#pat) and its records | enum | Patterns. |
-| [`Ty`](#ty), [`Effects`](#effects-1) | types | Type terms (all optional) and effect sets. |
-| [`Binder`](#binder), [`Path`](#path), [`Res`](#res), [`Ns`](#ns) | types | Binding and name references. |
+| [`Ty`](#ty), [`Bound`](#bound), [`GenericArg`](#genericarg), [`Effects`](#effects-1) | types | Type terms (all optional), bounds, generic arguments, effect sets. |
+| [`Binder`](#binder), [`Path`](#path), [`PathRoot`](#pathroot), [`QSelf`](#qself), [`Res`](#res), [`Ns`](#ns) | types | Binding and name references. |
 | [`Lit`](#lit), [`Prim`](#prim) | types | Literals and primitive types. |
 | [`Op`](#op), [`OpKind`](#opkind), [`Policy`](#policy) | types | Intrinsic operations from `specs/OPS.md`. |
 | [Ids](#ids), [`NodeRef`](#noderef), [`List`](#list), [`TextRef`](#textref) | types | Dense typed handles. |
 | [`Origin`](#origin), [`Expansion`](#expansion), [`Name`](#name), [`Ident`](#ident) | types | Where nodes came from; hygienic names. |
+| [`Event`](#event), [`Frame`](#frame), [`Control`](#control) | enums | Walk events, including scopes, binders, and frames. |
 | [`HirError`](#hirerror) and its details | enums | Why a HIR or a resolution was rejected. |
 
 ## Installation
 
 ```toml
 [dependencies]
-hir-lang = "0.2"
+hir-lang = "0.3"
 intern-lang = "1"   # names are intern_lang::Symbol
 ```
 
@@ -78,7 +86,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-hir-lang = { version = "0.2", default-features = false }
+hir-lang = { version = "0.3", default-features = false }
 ```
 
 ## Quick start
@@ -91,8 +99,9 @@ let mut names = Interner::new();
 let mut b = Builder::new();
 
 // fn inc(n) { n + 1 }   with `n` left for a resolver to resolve
-let (param, n) = b.local_param(Name::new(names.intern("n")));
-let use_n = b.name_expr(Name::new(names.intern("n")));
+let n_name = Name::new(names.intern("n"));
+let (param, _n) = b.local_param(n_name);
+let use_n = b.name_expr(n_name);
 let one = b.int(1);
 let sum = b.op(OpKind::Add, &[use_n, one]);
 let body = b.block(&[], Some(sum));
@@ -101,6 +110,7 @@ let root = b.module(None, &[inc]);
 
 let mut hir = b.finish(root)?;            // validated
 let Expr::Path(path) = *hir.expr(use_n) else { unreachable!() };
+let n = hir.lookup_local(path, n_name).expect("in scope");  // the scope rule, reused
 hir.resolve(path, Res::Local(n))?;        // checked in O(1)
 
 assert!(hir_lang::print(&hir, &names).contains("(use (path n → local n%0))"));
@@ -119,9 +129,27 @@ children are [`List`](#list)s into per-type pools, and literal text lives in one
 byte pool ([`TextRef`](#textref)). No node owns a heap allocation, so cloning,
 comparing, debug-printing, and dropping a `Hir` are flat loops at any depth.
 
-The nodes form **one tree** rooted at a module: every node except the root has
-exactly one parent, and every node is reachable. Sharing a node between two
-parents, cycles, and orphans are rejected.
+The **live** nodes form one tree rooted at a module: every live node except the
+root has exactly one parent and is reachable. Sharing a node between two
+parents and cycles are rejected. Unreachable nodes are rejected too, except
+**dead error forms** (an error item, expression, statement, pattern, type, or
+path; a field or unit variant with nothing in it; a parameter whose pattern is
+`Pat::Err`), which lenient repairs leave behind and which are harmless.
+
+### Units and definition ids
+
+A `Hir` is one compilation unit, identified by a host-assigned
+[`UnitId`](#unitid) (`Builder::for_unit`; `Builder::new` builds unit 0).
+Resolutions name items and sum variants only through a [`DefId`](#defid):
+`(unit, Def::Item | Def::Variant)`. A `DefId` for this unit is checked (the
+definition exists and fits the namespace); one for another unit is accepted
+as is, for the host to check against that unit.
+
+Ids are unforgeable across `Hir`s of the same unit: [`Builder::def`](#builderunit--builderdef)
+and [`Hir::def`](#hirunit--hirdef) mint ids carrying a private tag of their
+issuer, and a tagged `DefId` from a different `Hir` of this unit is rejected
+with [`ForeignDef`](#hirerror). [`DefId::foreign`](#defid) makes untagged ids
+(for other units and for decoders). Equality and hashing ignore the tag.
 
 ### Origins and expansions
 
@@ -138,31 +166,43 @@ can never be confused with user variables of the same spelling.
 ### Binders, scopes, and frames
 
 Variables, parameters, captures, generic parameters, and labels are
-[`Binder`](#binder)s with unique ids. Each is bound at exactly one site (the
-alternatives of an or-pattern bind the same set). A binder is visible:
+[`Binder`](#binder)s with unique ids. Each is bound by at most one construct
+(the alternatives of an or-pattern bind the same set, with the same modes); a
+binder bound nowhere is allowed and is in no scope. A binder is visible:
 
 | Bound by | Visible in |
 |---|---|
-| `let` pattern | later statements and the tail of the block |
-| parameter pattern | later parameters' defaults, the return/throws types, the body |
+| `let` pattern, `static`, `global` statement | later statements and the tail of the block |
+| parameter pattern | later parameters' defaults (per-call evaluation), the return/throws types, the body |
 | `match`/`catch` arm pattern | the arm's guard and body |
-| explicit capture | the closure's parameters and body |
+| explicit capture, a closure's `self_binder` | the closure's parameters and body |
 | generic parameter | the whole item |
 | loop/block label | the loop's body and step, or the block |
 
-**Frames** further limit what can be referenced: items, closures, and constant
-contexts (array lengths, const generic arguments, discriminants, field
-defaults) each start a frame. Value binders cross only closures that allow
-implicit captures; type-level binders also cross constant contexts and the
-member items of an impl, interface, or class.
+**Frames** further limit what can be referenced: items, closures, parameter
+defaults, and constant contexts (array lengths, const generic arguments,
+discriminants, field defaults) each start a frame. Value binders cross only
+closures that allow implicit captures, and parameter defaults; type-level
+binders also cross constant contexts and the member items of an impl,
+interface, or class. A default evaluated once at definition
+([`DefaultEval::Once`](#expr-records), Python) cannot see the function's own
+parameters. A module with a body is a frame like a function's.
 
 ### Resolution
 
-A name reference is a [`Path`](#path) node with a namespace ([`Ns`](#ns), fixed by
-its parent) and a resolution slot ([`Res`](#res)). Lowering may fill slots it
-knows (template temporaries); resolve-lang fills the rest with
-[`Hir::resolve`](#hirresolve), which checks namespace, scope, and frames in O(1)
-using the index the validator computed. The HIR stays valid after every call.
+A name reference is a [`Path`](#path) node with a namespace ([`Ns`](#ns), fixed
+by its parent), a root (`::`, `self::`, `super::`, `Self::`, `parent::`,
+`static::`), an optional qualified self (`<T as Tr>::`), and a resolution slot:
+a [`Res`](#res) plus the number of trailing segments left **unresolved** for
+type-directed resolution (`Vec::new`, `T::Item`, `Self::Output`).
+
+Lowering may fill slots it knows (template temporaries); resolve-lang fills
+the rest with [`Hir::resolve`](#hirresolve--hirresolve_partial) /
+`resolve_partial`, which check shape, namespace, scope, and frames in O(1)
+using the index the validator computed. [`Hir::lookup_local`](#hirlookup_local)
+answers "which binder named `x` is in scope here" in O(log n + d), and the walk
+reports [scope, binder, and frame events](#event), so the resolver never
+re-derives the scope rules. The HIR stays valid after every call.
 
 ### Operations and policies
 
@@ -174,27 +214,42 @@ execution tier behaves the same. [`Op::new`](#op) gives the OPS defaults.
 ### Effects
 
 `throw`, `try`, `await`, `yield`, `spawn`, and `defer` are explicit forms.
-Functions and closures declare [`Effects`](#effects-1); the validator accepts
-`await` only in `ASYNC` frames, `yield` only in `YIELD` frames, and `throw` only
-in `THROWS` frames or inside a `try` body of the same frame. `return` needs a
-function or closure; no jump may leave a `defer` or `finally`.
+Functions, closures, and module bodies declare [`Effects`](#effects-1); the
+validator accepts `await` only in `ASYNC` frames, `yield` only in `YIELD`
+frames (and never inside a `defer` or `finally`, since cleanup runs when a
+generator is closed), and `throw` only in `THROWS` frames or inside a `try`
+body of the same frame. `ASYNC | YIELD` is an async generator. `return` needs a
+function, closure, or module body; jumps may leave a `finally` (overriding the
+pending completion) but never a `defer`.
 
-### What the validator checks
+Declared effects describe the explicit forms only: any fallible operation can
+raise at run time per the language's error model, and the body graph (spec
+§19, hir-lang 0.5) gives each one an unwind edge.
 
-[`Builder::finish`](#builderfinish) runs it; it is total (any arena is accepted or
-rejected with a precise [`HirError`](#hirerror), never a panic) and linear. In
-order: every id, list, and text range in bounds; expansions ordered; each
-node's own shape (literals, op arity and policies, assignment targets,
-parameter order, record shapes, unique member names); then one walk checking
-the tree, binder sites, namespaces, jumps, effects, and item placement; then
-unreachable nodes; then unbound binders; then the scope of every resolved
-local.
+### Strict and lenient validation
+
+[`Builder::finish`](#builderfinish--builderfinish_lenient) is strict: it
+returns the first problem. [`Builder::finish_lenient`](#builderfinish--builderfinish_lenient)
+collects every problem, repairs each (the offending node becomes its error
+form, or a narrower fix: an error resolution, a wildcard binding, a corrected
+binder kind), and returns the valid `Hir` with the problems in source order;
+it fails only on capacity overflow or a root that is missing or not a module.
+Both are total (never panic) and linear. The checks, in order:
+
+1. every id, list, and text range in bounds; expansions ordered;
+2. each node's own shape: literals, op arity and policies, assignment and
+   place forms, parameter order, record shapes, unique member names, asm
+   templates, intrinsic orderings;
+3. one walk checking the tree, binder sites, namespaces and path shapes,
+   jumps, effects, and item placement;
+4. unreachable live nodes;
+5. the scope and frames of every resolved local.
 
 ### Canonical order
 
 Children are visited in the order a node's fields are listed (which is also
-evaluation order). The walker, the validator's scopes, and the printer all
-derive from one definition of that order.
+evaluation order). The walker, the validator's scopes, the error order, and the
+printer all derive from one definition of that order.
 
 ## `Builder`
 
@@ -206,18 +261,41 @@ Builds a HIR bottom-up. It never panics: an arena that would outgrow `u32`
 indexes is recorded and reported by `finish`. Ids it issues are only
 meaningful for the HIR it finishes.
 
-### `Builder::new`
+### `Builder::new` / `Builder::for_unit`
 
 ```rust,ignore
 pub fn new() -> Builder
+pub fn for_unit(unit: UnitId) -> Builder
 ```
 
-An empty builder whose current origin is `0..0` in source. Also `Default`.
+An empty builder whose current origin is `0..0` in source. `new` (also
+`Default`) builds unit 0; `for_unit` builds the given unit.
 
 ```rust
-use hir_lang::{Builder, Origin};
+use hir_lang::{Builder, Origin, UnitId};
 
 assert_eq!(Builder::new().origin(), Origin::default());
+assert_eq!(Builder::for_unit(UnitId::new(3)).unit(), UnitId::new(3));
+```
+
+### `Builder::unit` / `Builder::def`
+
+```rust,ignore
+pub fn unit(&self) -> UnitId
+pub fn def(&self, def: Def) -> DefId
+```
+
+`def` mints a [`DefId`](#defid) for a definition of this unit, tagged so that a
+different `Hir` of the same unit rejects it.
+
+```rust
+use hir_lang::{Builder, Def, DefId, Item, ItemKind, Name, Ns, Res, UnitId};
+use intern_lang::Interner;
+
+let mut names = Interner::new();
+let mut b = Builder::for_unit(UnitId::new(1));
+let max = b.item(Item::new(Some(Name::new(names.intern("MAX"))), ItemKind::Const { ty: None, value: None }));
+assert_eq!(b.def(Def::Item(max)), DefId::foreign(UnitId::new(1), Def::Item(max)));
 ```
 
 ### `Builder::origin` / `set_origin` / `set_span` / `set_expansion`
@@ -324,7 +402,8 @@ pub fn text(&mut self, text: &str) -> TextRef
 pub fn bytes(&mut self, bytes: &[u8]) -> TextRef
 ```
 
-Store literal payloads (strings; byte strings and big-integer digits).
+Store literal payloads (strings; byte strings, big-integer digits, asm
+templates and constraints).
 
 ```rust
 use hir_lang::{Builder, Lit};
@@ -356,6 +435,40 @@ assert_eq!(b.finish(root)?.attrs(NodeRef::Item(root)).len(), 1);
 # Ok::<(), hir_lang::HirError>(())
 ```
 
+### `Builder::copy_subtree`
+
+```rust,ignore
+pub fn copy_subtree(&mut self, node: NodeRef) -> NodeRef
+```
+
+Copies a subtree for template instantiation, inlining, or unrolling. Every
+binder **bound inside** it gets a fresh binder in the copy (references inside
+follow); references to outer binders are kept; origins and attributes are
+copied. The copy is unattached. Iterative. On a foreign id or overflow, the
+overflow is recorded (reported by `finish`) and `node` is returned.
+
+```rust
+use hir_lang::{BinderKind, Builder, Expr, Name, NodeRef};
+use intern_lang::Interner;
+
+let mut names = Interner::new();
+let mut b = Builder::new();
+let t = b.new_binder(Name::new(names.intern("t")), BinderKind::Local);
+let pat = b.bind(t);
+let one = b.int(1);
+let decl = b.let_stmt(pat, Some(one));
+let use_t = b.use_binder(t);
+let original = b.block(&[decl], Some(use_t));
+let NodeRef::Expr(copy) = b.copy_subtree(NodeRef::Expr(original)) else { unreachable!() };
+let pair = b.list(&[original, copy]);
+let both = b.expr(Expr::Tuple(pair));
+let body = b.block(&[], Some(both));
+let f = b.func(Name::new(names.intern("f")), &[], body);
+let root = b.module(None, &[f]);
+assert_eq!(b.finish(root)?.count(hir_lang::IdKind::Binder), 2);
+# Ok::<(), hir_lang::HirError>(())
+```
+
 ### Conveniences
 
 | Method | Creates |
@@ -365,19 +478,19 @@ assert_eq!(b.finish(root)?.attrs(NodeRef::Item(root)).len(), 1);
 | `str_lit(&str) -> ExprId` | a string literal |
 | `op(kind, &[ExprId]) -> ExprId` | `Expr::Op` at the OPS default policy |
 | `op_with(op, &[ExprId]) -> ExprId` | `Expr::Op` with an explicit policy |
-| `call(callee, &[ExprId]) -> ExprId` | `Expr::Call` with positional arguments |
+| `call(callee, &[ExprId]) -> ExprId` | `Expr::Call` with positional, by-value arguments |
 | `new_binder(name, kind) -> BinderId` | an immutable binder |
 | `bind(binder) -> PatId` | a by-value `Pat::Bind` |
 | `local_param(name) -> (ParamId, BinderId)` | a `Normal` parameter binding a fresh `Param` binder |
-| `name_path(name, ns) -> PathId` | an unresolved one-segment path |
-| `resolved_path(name, ns, res) -> PathId` | a one-segment path with a resolution |
+| `name_path(name, ns) -> PathId` | an unresolved one-segment relative path |
+| `resolved_path(name, ns, res) -> PathId` | a one-segment path with a full resolution |
 | `name_expr(name) -> ExprId` | an expression naming `name`, unresolved |
 | `use_binder(binder) -> ExprId` | an expression already resolved to `binder` (hygiene by construction) |
 | `block(&[StmtId], Option<ExprId>) -> ExprId` | an unlabeled block |
 | `let_stmt(pat, Option<ExprId>) -> StmtId` | `let pat = init;` |
 | `expr_stmt(ExprId) -> StmtId` | an expression statement |
 | `func(name, &[ParamId], body) -> ItemId` | a private function with no generics or effects |
-| `module(Option<Name>, &[ItemId]) -> ItemId` | a private module |
+| `module(Option<Name>, &[ItemId]) -> ItemId` | a private module without a body |
 
 ```rust
 use hir_lang::{Builder, Name, OpKind, Op, Overflow};
@@ -395,24 +508,48 @@ let root = b.module(None, &[f]);
 assert!(b.finish(root).is_ok());
 ```
 
-### `Builder::finish`
+### `Builder::finish` / `Builder::finish_lenient`
 
 ```rust,ignore
 pub fn finish(self, root: ItemId) -> Result<Hir, HirError>
+pub fn finish_lenient(self, root: ItemId) -> Result<(Hir, Vec<HirError>), HirError>
 ```
 
-Validates everything built with `root` (a module) as the root.
+Validate everything built with `root` (a module) as the root.
 
-**Errors:** [`CapacityExceeded`](#hirerror) if building overflowed; otherwise
-the first validation error (see [What the validator checks](#what-the-validator-checks)).
+`finish` is strict. **Errors:** [`CapacityExceeded`](#hirerror) if building
+overflowed; otherwise the first problem (see
+[Strict and lenient validation](#strict-and-lenient-validation)).
+
+`finish_lenient` is for user code: every problem is collected and repaired,
+and the repaired, valid `Hir` is returned with the problems sorted by source
+position (span start, then discovery order). Consequences of a repair (the
+children of a replaced node, references to binders it bound) are fixed
+silently, not reported again. **Errors:** only where no repair exists:
+`CapacityExceeded`, a missing root (`Dangling`), or `RootNotModule`.
 
 ```rust
-use hir_lang::{Builder, Expr, HirError, NodeRef};
+use hir_lang::{Builder, Expr, HirError, IntLit, JumpProblem, Lit, NodeRef, Prim};
 
+// strict: an orphan expression is rejected
 let mut b = Builder::new();
-let stray = b.expr(Expr::Err);
+let orphan = b.int(1);
 let root = b.module(None, &[]);
-assert_eq!(b.finish(root), Err(HirError::Unreachable { node: NodeRef::Expr(stray) }));
+assert_eq!(b.finish(root), Err(HirError::Unreachable { node: NodeRef::Expr(orphan) }));
+
+// lenient: a stray `break` and an out-of-range literal become diagnostics
+let mut b = Builder::new();
+let stray = b.expr(Expr::Break { label: None, value: None });
+let big = b.lit(Lit::Int(IntLit::new(300).with_suffix(Prim::U8)));
+let (s1, s2) = (b.expr_stmt(stray), b.expr_stmt(big));
+let body = b.block(&[s1, s2], None);
+let f = b.func(hir_lang::Name::new(intern_lang::Interner::new().intern("f")), &[], body);
+let root = b.module(None, &[f]);
+let (hir, problems) = b.finish_lenient(root)?;
+assert_eq!(problems.len(), 2);
+assert!(problems.contains(&HirError::Jump { expr: stray, problem: JumpProblem::BreakOutsideLoop }));
+assert_eq!(hir.expr(stray), &Expr::Err);
+# Ok::<(), HirError>(())
 ```
 
 ## `Hir`
@@ -421,24 +558,26 @@ assert_eq!(b.finish(root), Err(HirError::Unreachable { node: NodeRef::Expr(stray
 pub struct Hir { /* private */ }   // Clone, Debug, PartialEq, Eq
 ```
 
-A validated HIR. Accessors never panic: a foreign id reads as an error node
-(`ItemKind::Err`, `Expr::Err`, `Stmt::Err`, `Pat::Err`, `Ty::Err`, an empty
-path resolved to `Res::Err`, an empty field), or `None` for the records that
-have no error form.
+A validated HIR of one unit. Accessors never panic in release builds: a
+foreign id reads as an error node (`ItemKind::Err`, `Expr::Err`, `Stmt::Err`,
+`Pat::Err`, `Ty::Err`, the error path, an empty field, a `Pat::Err`
+parameter) and is a `debug_assert!` failure in debug builds. The `get_*`
+variants return `None` instead. Records without an error form (variants,
+binders, expansions) are `Option`-only.
 
 ### Node accessors
 
 ```rust,ignore
 pub fn root(&self) -> ItemId
-pub fn item(&self, id: ItemId) -> &Item
-pub fn expr(&self, id: ExprId) -> &Expr
-pub fn stmt(&self, id: StmtId) -> &Stmt
-pub fn pat(&self, id: PatId) -> &Pat
-pub fn ty(&self, id: TyId) -> &Ty
-pub fn path(&self, id: PathId) -> &Path
-pub fn field(&self, id: FieldId) -> &FieldDef
+pub fn item(&self, id: ItemId) -> &Item        pub fn get_item(&self, id: ItemId) -> Option<&Item>
+pub fn expr(&self, id: ExprId) -> &Expr        pub fn get_expr(&self, id: ExprId) -> Option<&Expr>
+pub fn stmt(&self, id: StmtId) -> &Stmt        pub fn get_stmt(&self, id: StmtId) -> Option<&Stmt>
+pub fn pat(&self, id: PatId) -> &Pat           pub fn get_pat(&self, id: PatId) -> Option<&Pat>
+pub fn ty(&self, id: TyId) -> &Ty              pub fn get_ty(&self, id: TyId) -> Option<&Ty>
+pub fn path(&self, id: PathId) -> &Path        pub fn get_path(&self, id: PathId) -> Option<&Path>
+pub fn field(&self, id: FieldId) -> &FieldDef  pub fn get_field(&self, id: FieldId) -> Option<&FieldDef>
+pub fn param(&self, id: ParamId) -> &Param     pub fn get_param(&self, id: ParamId) -> Option<&Param>
 pub fn variant(&self, id: VariantId) -> Option<&Variant>
-pub fn param(&self, id: ParamId) -> Option<&Param>
 pub fn binder(&self, id: BinderId) -> Option<&Binder>
 pub fn expansion(&self, id: ExpnId) -> Option<&Expansion>
 pub fn variant_owner(&self, id: VariantId) -> Option<ItemId>
@@ -449,7 +588,7 @@ pub fn count(&self, kind: IdKind) -> usize
 tables are plain vectors. `variant_owner` returns the sum declaring a variant.
 
 ```rust
-use hir_lang::{Builder, Expr, IdKind, ItemKind};
+use hir_lang::{Builder, Expr, ExprId, IdKind, ItemKind};
 
 let mut b = Builder::new();
 let one = b.int(1);
@@ -460,6 +599,26 @@ let hir = b.finish(root)?;
 assert!(matches!(hir.item(f).kind, ItemKind::Fn(_)));
 assert!(matches!(hir.expr(one), Expr::Lit(_)));
 assert_eq!(hir.count(IdKind::Expr), 2);
+assert!(hir.get_expr(ExprId::from_index(99).unwrap()).is_none());
+# Ok::<(), hir_lang::HirError>(())
+```
+
+### `Hir::unit` / `Hir::def`
+
+```rust,ignore
+pub fn unit(&self) -> UnitId
+pub fn def(&self, def: Def) -> DefId
+```
+
+The unit, and a tagged [`DefId`](#defid) for one of its definitions.
+
+```rust
+use hir_lang::{Builder, Def, UnitId};
+
+let mut b = Builder::for_unit(UnitId::new(4));
+let root = b.module(None, &[]);
+let hir = b.finish(root)?;
+assert_eq!(hir.def(Def::Item(root)).unit(), UnitId::new(4));
 # Ok::<(), hir_lang::HirError>(())
 ```
 
@@ -524,42 +683,96 @@ assert!(b.finish(root)?.attrs(NodeRef::Item(root)).is_empty());
 # Ok::<(), hir_lang::HirError>(())
 ```
 
-### `Hir::resolve`
+### `Hir::resolve` / `Hir::resolve_partial`
 
 ```rust,ignore
 pub fn resolve(&mut self, path: PathId, res: Res) -> Result<(), HirError>
+pub fn resolve_partial(&mut self, path: PathId, res: Res, unresolved: u32) -> Result<(), HirError>
 ```
 
-Sets a path's resolution after an O(1) check. On error nothing changes.
+Set a path's resolution after an O(1) check. `resolve` resolves every
+segment; `resolve_partial` resolves the first `segments - unresolved` and
+leaves the rest for type-directed resolution. On error nothing changes.
 
 | Error | When |
 |---|---|
-| [`Dangling`](#hirerror) | `path`, or the binder/item/variant in `res`, is not in this HIR |
-| [`Resolution`](#hirerror) | the path's namespace cannot name `res` |
+| [`Dangling`](#hirerror) | `path`, or the binder or this unit's definition in `res`, does not exist |
+| [`ForeignDef`](#hirerror) | `res` names this unit through a `DefId` minted by another `Hir`/builder |
+| [`Malformed`](#hirerror) (`PathShape`) | `unresolved` does not fit the path's segments, root, or qualified self |
+| [`Resolution`](#hirerror) | the namespace cannot name `res` (with unresolved segments: `res` has no associated items) |
 | [`OutOfScope`](#hirerror) | `res` is a binder not in scope at the path |
 | [`NotCapturable`](#hirerror) | `res` is a binder behind a frame the path may not cross |
 
 ```rust
-use hir_lang::{BinderKind, Builder, Expr, HirError, Name, Res};
+use hir_lang::{BinderKind, Builder, Def, Expr, HirError, Item, ItemKind, Name, Ns, Path, RecordDef, Res, Segment};
 use intern_lang::Interner;
 
 let mut names = Interner::new();
 let mut b = Builder::new();
+// `Point::new` — resolve-lang binds `Point`, typeck resolves `new`.
+let point = b.item(Item::new(Some(Name::new(names.intern("Point"))), ItemKind::Record(RecordDef::default())));
+let segs = [
+    Segment::new(Name::new(names.intern("Point")), b.origin()),
+    Segment::new(Name::new(names.intern("new")), b.origin()),
+];
+let segments = b.list(&segs);
+let ctor = b.path(Path::new(segments, Ns::Value));
+let call = b.expr(Expr::Path(ctor));
+let s0 = b.expr_stmt(call);
+// `x` used before its `let`.
 let early = b.name_expr(Name::new(names.intern("x")));
 let s1 = b.expr_stmt(early);
 let x = b.new_binder(Name::new(names.intern("x")), BinderKind::Local);
 let px = b.bind(x);
 let one = b.int(1);
 let s2 = b.let_stmt(px, Some(one));
-let body = b.block(&[s1, s2], None);
+let body = b.block(&[s0, s1, s2], None);
 let f = b.func(Name::new(names.intern("f")), &[], body);
-let root = b.module(None, &[f]);
+let root = b.module(None, &[point, f]);
 let mut hir = b.finish(root)?;
 
+let point_def = hir.def(Def::Item(point));
+hir.resolve_partial(ctor, Res::Def(point_def), 1)?;
+assert_eq!(hir.path(ctor).unresolved, 1);
+
 let Expr::Path(p) = *hir.expr(early) else { unreachable!() };
-// `x` is used before its `let`.
 assert_eq!(hir.resolve(p, Res::Local(x)), Err(HirError::OutOfScope { path: p, binder: x }));
 assert_eq!(hir.path(p).res, Res::Unresolved);
+# Ok::<(), hir_lang::HirError>(())
+```
+
+### `Hir::lookup_local`
+
+```rust,ignore
+pub fn lookup_local(&self, path: PathId, name: Name) -> Option<BinderId>
+```
+
+The lexically innermost binder named `name` (symbol and mark) in the path's
+namespace that is in scope at `path`, in O(log n + d) (d = nesting depth of
+same-named binders). Frames are not filtered: a result behind a frame the path
+may not cross is then reported by `resolve` as `NotCapturable`.
+
+```rust
+use hir_lang::{BinderKind, Builder, Expr, Name};
+use intern_lang::Interner;
+
+// { let x = 1; { let x = 2; x } }  — the inner `x` wins.
+let mut names = Interner::new();
+let x = Name::new(names.intern("x"));
+let mut b = Builder::new();
+let outer = b.new_binder(x, BinderKind::Local);
+let inner = b.new_binder(x, BinderKind::Local);
+let (po, pi) = (b.bind(outer), b.bind(inner));
+let (one, two) = (b.int(1), b.int(2));
+let (so, si) = (b.let_stmt(po, Some(one)), b.let_stmt(pi, Some(two)));
+let use_x = b.name_expr(x);
+let inner_block = b.block(&[si], Some(use_x));
+let body = b.block(&[so], Some(inner_block));
+let f = b.func(Name::new(names.intern("f")), &[], body);
+let root = b.module(None, &[f]);
+let hir = b.finish(root)?;
+let Expr::Path(p) = *hir.expr(use_x) else { unreachable!() };
+assert_eq!(hir.lookup_local(p, x), Some(inner));
 # Ok::<(), hir_lang::HirError>(())
 ```
 
@@ -570,8 +783,7 @@ pub fn can_reference(&self, path: PathId, binder: BinderId) -> bool
 ```
 
 Whether `resolve(path, Res::Local(binder))` would succeed: the binder's kind
-fits the namespace, it is in scope, and no frame forbids it. A resolver uses it
-to filter candidates.
+fits the namespace, it is in scope, and no frame forbids it.
 
 ```rust
 use hir_lang::{Builder, Expr, Name};
@@ -590,33 +802,35 @@ assert!(hir.can_reference(path, n));
 # Ok::<(), hir_lang::HirError>(())
 ```
 
-### `Hir::implicit_captures`
+### `Hir::implicit_captures` / `Hir::all_implicit_captures`
 
 ```rust,ignore
 pub fn implicit_captures(&self, closure: ExprId) -> Vec<BinderId>
+pub fn all_implicit_captures(&self) -> Vec<(ExprId, Vec<BinderId>)>
 ```
 
 The value binders defined outside a closure that its body or parameter
 defaults reference through resolved paths, in first-use order. Explicit
-captures are excluded (they are in `Closure::captures`). Empty for a
-non-closure. Linear in the closure's size.
+captures and the closure's `self_binder` are excluded. `implicit_captures` is
+linear in the closure's size (empty for a non-closure);
+`all_implicit_captures` computes every closure's set in one walk (closures in
+preorder, only those with captures), linear in the HIR plus the output.
 
 ```rust
-use hir_lang::{Builder, CaptureMode, Closure, Effects, Expr, List, Name};
+use hir_lang::{Builder, CaptureMode, Closure, Expr, Name};
 use intern_lang::Interner;
 
 let mut names = Interner::new();
 let mut b = Builder::new();
 let (p, k) = b.local_param(Name::new(names.intern("k")));
 let body = b.use_binder(k);
-let c = b.expr(Expr::Closure(Closure {
-    params: List::EMPTY, ret: None, body, effects: Effects::NONE,
-    implicit: Some(CaptureMode::ByValue), captures: List::EMPTY,
-}));
+let c = b.expr(Expr::Closure(Closure { implicit: Some(CaptureMode::ByValue), ..Closure::new(body) }));
 let fbody = b.block(&[], Some(c));
 let f = b.func(Name::new(names.intern("f")), &[p], fbody);
 let root = b.module(None, &[f]);
-assert_eq!(b.finish(root)?.implicit_captures(c), vec![k]);
+let hir = b.finish(root)?;
+assert_eq!(hir.implicit_captures(c), vec![k]);
+assert_eq!(hir.all_implicit_captures(), vec![(c, vec![k])]);
 # Ok::<(), hir_lang::HirError>(())
 ```
 
@@ -627,19 +841,23 @@ pub fn walk_from<F: FnMut(Event) -> Control>(&self, start: NodeRef, f: F)
 pub fn children_into(&self, node: NodeRef, out: &mut Vec<NodeRef>)
 ```
 
-`walk_from` delivers `Enter`/`Leave` [events](#traversal) for the subtree of
-`start` in canonical order with an explicit stack (any depth is safe).
-`children_into` appends a node's direct children.
+`walk_from` delivers [events](#event) for the subtree of `start` in canonical
+order with an explicit stack (any depth is safe): node entry and exit, and the
+scopes, binders, and frames. `children_into` appends a node's direct children.
 
 ```rust
-use hir_lang::{Builder, Control, Event, NodeRef};
+use hir_lang::{Builder, Control, Event, Frame, NodeRef};
 
 let mut b = Builder::new();
-let root = b.module(None, &[]);
+let body = b.block(&[], None);
+let f = b.func(hir_lang::Name::new(intern_lang::Interner::new().intern("f")), &[], body);
+let root = b.module(None, &[f]);
 let hir = b.finish(root)?;
 let mut events = Vec::new();
-hir.walk_from(NodeRef::Item(root), |e| { events.push(e); Control::Continue });
-assert_eq!(events, [Event::Enter(NodeRef::Item(root)), Event::Leave(NodeRef::Item(root))]);
+hir.walk_from(NodeRef::Item(f), |e| { events.push(e); Control::Continue });
+assert_eq!(events.first(), Some(&Event::Enter(NodeRef::Item(f))));
+assert!(events.contains(&Event::FrameOpen(Frame::Item(f))));
+assert_eq!(events.last(), Some(&Event::Leave(NodeRef::Item(f))));
 # Ok::<(), hir_lang::HirError>(())
 ```
 
@@ -649,8 +867,9 @@ assert_eq!(events, [Event::Enter(NodeRef::Item(root)), Event::Leave(NodeRef::Ite
 pub fn validate(&self) -> Result<(), HirError>
 ```
 
-Re-runs the validator. Always `Ok` for a `Hir` from this crate (`resolve`
-preserves validity); offered for tests and debug builds of consumers.
+Re-runs the strict validator. Always `Ok` for a `Hir` from this crate
+(`resolve` preserves validity, and lenient repairs produce valid HIR);
+offered for tests and debug builds of consumers.
 
 ```rust
 use hir_lang::Builder;
@@ -669,7 +888,7 @@ assert_eq!(b.finish(root)?.validate(), Ok(()));
 pub fn walk<F: FnMut(NodeRef)>(hir: &Hir, f: F)
 ```
 
-The Tier-1 traversal: every node from the root, in canonical preorder.
+The Tier-1 traversal: every live node from the root, in canonical preorder.
 
 ```rust
 use hir_lang::Builder;
@@ -716,28 +935,30 @@ pub struct Item { pub name: Option<Name>, pub name_span: Span, pub vis: Vis, pub
 A declaration. `Item::new(name, kind)` makes a private item; `with_vis` and
 `with_name_span` adjust it. Names are required for functions, records, sums,
 classes, interfaces, aliases, associated types, constants, and globals; absent
-for impls and glob imports; optional for modules, imports (the alias), and
-errors.
+for impls, mixin uses, and glob imports; optional for modules, imports (the
+alias), and errors.
 
 ### `ItemKind`
 
 | Variant | Fields | Notes |
 |---|---|---|
-| `Fn(FnDef)` | generics, params, ret, effects, throws, abi, body | body absent only in an interface, a class (abstract), or with an `abi` |
-| `Record(RecordDef)` | generics, shape, fields | |
+| `Fn(FnDef)` | generics, params, ret, effects, throws, abi, body, defaults | body absent only in an interface, a class (abstract), or with an `abi` |
+| `Record(RecordDef)` | generics, shape, fields, is_union | a union has named fields |
 | `Sum(SumDef)` | generics, variants | variant names unique |
-| `Class(ClassDef)` | generics, base, interfaces, fields, items, is_abstract, is_final | members: `Fn`, `Const`, `Global`, `Alias` |
+| `Class(ClassDef)` | generics, bases, interfaces, fields, items, is_abstract, is_final, mixin | members: `Fn`, `Const`, `Global`, `Alias`, `MixinUse` |
 | `Interface(InterfaceDef)` | generics, supers, items | members: `Fn`, `Const`, `AssocType` |
 | `Impl(ImplDef)` | generics, interface, self_ty, items | members: `Fn`, `Const`, `Alias` |
 | `Alias { generics, ty }` | | a type alias or an impl's associated type |
-| `AssocType { bounds, default }` | | only in an interface |
+| `AssocType { bounds: List<Bound>, default }` | | only in an interface |
 | `Const { ty, value }` | | value absent only in an interface |
 | `Global { ty, mutable, init }` | | globals and statics |
-| `Module { items }` | | the root is a module |
+| `Module { items, body: Option<ExprId>, effects }` | | the root is a module; `body` is top-level code (scripts, NOML, REPL entries) |
 | `Import { path, glob }` | | `Import`-namespace path |
+| `MixinUse(MixinUseDef)` | mixins, rules | PHP `use T { … }` in a class; expanded by resolve-lang |
 | `Err` | | a declaration that failed to lower |
 
-`ItemKind::name()` returns the printer's spelling (`"fn"`, `"record"`, ...).
+`ItemKind::name()` returns the printer's spelling (`"fn"`, `"record"`,
+`"mixin-use"`, ...).
 
 ```rust
 use hir_lang::{Builder, Ident, Item, ItemKind, Name, RecordDef, FieldDef, Prim, Shape, Span, Ty};
@@ -760,21 +981,27 @@ assert!(b.finish(root).is_ok());
 
 | Type | Fields |
 |---|---|
-| `FnDef` (`Default`) | `generics: Generics`, `params: List<ParamId>`, `ret: Option<TyId>`, `effects: Effects`, `throws: Option<TyId>`, `abi: Option<Symbol>`, `body: Option<ExprId>` |
-| `RecordDef` (`Default`) | `generics`, `shape: Shape`, `fields: List<FieldId>` |
+| `FnDef` (`Default`) | `generics: Generics`, `params: List<ParamId>`, `ret: Option<TyId>`, `effects: Effects`, `throws: Option<TyId>`, `abi: Option<Symbol>`, `body: Option<ExprId>`, `defaults: DefaultEval` |
+| `RecordDef` (`Default`) | `generics`, `shape: Shape`, `fields: List<FieldId>`, `is_union: bool` |
 | `SumDef` (`Default`) | `generics`, `variants: List<VariantId>` |
-| `ClassDef` (`Default`) | `generics`, `base: Option<TyId>`, `interfaces: List<TyId>`, `fields`, `items: List<ItemId>`, `is_abstract`, `is_final` |
+| `ClassDef` (`Default`) | `generics`, `bases: List<TyId>` (method-resolution order), `interfaces: List<TyId>`, `fields`, `items: List<ItemId>`, `is_abstract`, `is_final`, `mixin: bool` (a PHP trait) |
 | `InterfaceDef` (`Default`) | `generics`, `supers: List<TyId>`, `items` |
 | `ImplDef` (`ImplDef::new(self_ty)`) | `generics`, `interface: Option<TyId>`, `self_ty: TyId`, `items` |
+| `MixinUseDef` (`Default`) | `mixins: List<TyId>`, `rules: List<MixinRule>` |
+| `MixinRule` | `method: Ident`, `from: Option<TyId>`, `action: MixinAction` |
+| `MixinAction` | `Insteadof(List<TyId>)`, `Alias { name: Option<Ident>, vis: Option<Vis> }` |
 | `Generics` (`Default`) | `params: List<GenericParam>`, `preds: List<WherePred>` |
-| `GenericParam` (`GenericParam::new(binder)`) | `binder`, `bounds: List<TyId>`, `ty: Option<TyId>` (a const parameter), `default: Option<TyId>` |
-| `WherePred` | `ty: TyId`, `bounds: List<TyId>` |
+| `GenericParam` (`GenericParam::new(binder)`) | `binder`, `bounds: List<Bound>`, `ty: Option<TyId>` (a const parameter), `default: Option<GenericArg>` |
+| `WherePred` | `subject: Bound` (a type or a region), `bounds: List<Bound>` |
 | `FieldDef` (`FieldDef::named(ident)`, `Default`) | `name: Option<Ident>`, `vis: Vis`, `ty: Option<TyId>`, `default: Option<ExprId>` (a constant context) |
-| `Variant` | `name: Ident`, `shape: Shape`, `fields: List<FieldId>`, `discriminant: Option<ExprId>` (a constant context) |
-| `Param` (`Param::new(pat)`) | `pat: PatId`, `ty: Option<TyId>`, `default: Option<ExprId>`, `kind: ParamKind` |
+| `Variant` | `name: Ident`, `shape: Shape`, `fields: List<FieldId>`, `discriminant: Option<ExprId>` (an integer constant context) |
+| `Param` (`Param::new(pat)`) | `pat: PatId`, `ty: Option<TyId>`, `default: Option<ExprId>` (its own frame), `kind: ParamKind`, `by_ref: bool` (PHP `&$x`) |
 | `Shape` | `Named` (default), `Tuple`, `Unit` |
-| `Vis` | `Private` (default), `Package`, `Public` |
+| `Vis` | `Private` (default), `Protected`, `Package`, `Public` |
 | `ParamKind` | `Receiver`, `PositionalOnly`, `Normal` (default), `Rest`, `NamedOnly`, `RestNamed` — in this order; `Receiver`/`Rest`/`RestNamed` at most once and without defaults; `Receiver` only first, only in interface/impl/class members |
+
+Visibility is recorded, not enforced: each language's access rules are a
+resolve-lang policy over `Vis` (spec §10).
 
 ### Attributes
 
@@ -799,29 +1026,48 @@ Attributes are data, never code. Attach with [`Builder::attach`](#builderattach)
 | `Record { path, fields, base }` | struct literal or anonymous record; field names unique |
 | `Map(List<MapEntry>)` | ordered key→value literal; an absent key means "next index" |
 | `Call { callee, args }` | call; named arguments unique |
-| `MethodCall { receiver, method, generic_args, args }` | method call (dispatched by type or runtime class) |
+| `MethodCall { receiver, method, generic_args: List<GenericArg>, args }` | method call (dispatched by type or runtime class) |
+| `DynMethodCall { receiver, name, args }` | `$o->$m()`: method chosen by a run-time string |
 | `Field { base, member, span }` | `base.name` / `base.0` |
+| `DynField { base, name }` | `$o->$p`: member chosen by a run-time string |
 | `Index { base, index }` | `base[index]` |
+| `VarVar(ExprId)` | `$$name`: the local named at run time |
+| `Append(ExprId)` | `$a[]`: the next slot; only as an assignment target or place argument |
 | `Op { op, args }` | intrinsic op; `args.len()` = arity |
 | `Cast { expr, ty, policy }` | `as`; policy has exactly `overflow` and `float_to_int` |
-| `Assign { target, op, value }` | `target` must be a place (`Path`, `Field`, `Index`, `Deref`, `Err`); `op` must be binary |
+| `Intrinsic { kind, generic_args, args }` | atomics, volatile, named intrinsics ([below](#intrinsic)) |
+| `Asm(Asm)` | structured inline assembly ([below](#asm)) |
+| `Assign { target, op, value }` | `target` must be a place; compound `op` only `add sub mul div floor_div rem floor_mod and or xor shl shr` |
+| `RefAssign { target, source }` | `$a = &$b`: both places |
 | `Deref(ExprId)`, `Borrow { kind, expr }` | `*e`, `&e` / `&mut e` / raw |
 | `Block(Block)` | statements + tail + optional label |
 | `If { cond, then, else_ }` | |
 | `Match { scrutinee, arms }` | first matching arm wins |
-| `Loop { label, body, step }` | the one loop; `step` runs after each iteration and on `continue` |
-| `Break { label, value }`, `Continue { label }`, `Return(Option)` | jumps |
-| `Closure(Closure)` | lambda with explicit captures |
+| `Loop { label, body, step }` | the one loop; `step` runs after each iteration and on `continue` (a `continue` of this loop inside its own step is invalid) |
+| `Break { label, value }`, `Continue { label }`, `Return(Option)` | jumps; may leave `finally`, never `defer` |
+| `Closure(Closure)` | lambda with explicit or implicit captures |
 | `Throw`, `Try { body, catches, finally }`, `Await`, `Yield(Option)`, `Spawn` | effects |
 | `Err` | failed to lower |
 
-Records: `Block { stmts, tail, label, is_unsafe }` (`Default`),
-`Arm { pat, guard, body }`, `Arg { kind: ArgKind, value }` (`Arg::positional`),
+**Places** are `Path`, `Field`, `DynField`, `Index`, `Deref`, `VarVar`,
+`Append` (write positions only), and `Err`.
+
+#### Expr records
+
+`Block { stmts, tail, label, is_unsafe }` (`Default`),
+`Arm { pat, guard, body }`,
+`Arg { kind: ArgKind, value, place: bool }` (`Arg::positional`; `place`
+passes the value as a place for a by-reference parameter, decided by the
+callee, at run time for dynamic calls; the value must be a place and the kind
+positional or named),
 `ArgKind = Positional | Named(Ident) | Spread | SpreadNamed`,
 `FieldInit { name: Ident, value }`, `MapEntry { key: Option<ExprId>, value }`,
 `Member = Named(Symbol) | Index(u32)`,
 `BorrowKind = Shared | Mut | RawConst | RawMut`,
-`Closure { params, ret, body, effects, implicit: Option<CaptureMode>, captures }`,
+`Closure { params, ret, body, effects, implicit: Option<CaptureMode>, captures, self_binder: Option<BinderId>, defaults: DefaultEval }`
+(`Closure::new(body)`; `self_binder` names the closure inside its body for
+recursion),
+`DefaultEval = PerCall (default) | Once`,
 `Capture { outer: PathId, binder: BinderId, mode }`,
 `CaptureMode = Infer | ByRef | ByMutRef | ByValue` (`Infer` only as a closure's implicit mode).
 
@@ -849,8 +1095,47 @@ assert!(b.finish(root).is_ok());
 | `Let { pat, ty, init, else_ }` | binders visible in later statements; `else_` requires `init` |
 | `Expr(ExprId)` | evaluated for effect |
 | `Item(ItemId)` | a local item (never sees the enclosing function's locals) |
-| `Defer(ExprId)` | runs at block exit; may not jump out of itself |
+| `Defer(ExprId)` | runs at block exit; no jump may leave it, `return` invalid inside |
+| `Static { binder, ty, init }` | function-static local (PHP `static $n = 0;`) |
+| `Global { binder, path }` | `global $x;`: a local aliasing the global `path` (`Value` namespace) |
 | `Err` | failed to lower |
+
+## Intrinsics and inline assembly
+
+### `Intrinsic`
+
+`#[non_exhaustive]`: `AtomicLoad(MemOrder)`, `AtomicStore(MemOrder)`,
+`AtomicRmw(RmwOp, MemOrder)`, `AtomicCmpXchg { success, failure }`,
+`Fence(MemOrder)`, `VolatileLoad`, `VolatileStore`, `Named(Symbol)` (any
+arity). `arity()` (`None` for `Named`), `orderings_ok()` (C++20 rules: loads
+not `Release`/`AcqRel`, stores not `Acquire`/`AcqRel`, fences not `Relaxed`,
+cmpxchg failure not `Release`/`AcqRel` and not stronger than success).
+`MemOrder = Relaxed | Acquire | Release | AcqRel | SeqCst`;
+`RmwOp = Xchg | Add | Sub | And | Or | Xor | Nand | Min | Max`.
+
+```rust
+use hir_lang::{Intrinsic, MemOrder};
+
+assert!(Intrinsic::AtomicLoad(MemOrder::Acquire).orderings_ok());
+assert!(!Intrinsic::Fence(MemOrder::Relaxed).orderings_ok());
+```
+
+### `Asm`
+
+`Asm { template: TextRef, operands: List<AsmOperand>, options: AsmOptions }`.
+The template is UTF-8; `{N}` names operand `N` (`{{`/`}}` are literal braces).
+`AsmOperand { dir: AsmDir, constraint: TextRef, expr }`,
+`AsmDir = In | Out | InOut | Const | Sym` (outputs are places, `Sym` operands
+are paths). `AsmOptions` is a bit set: `NONE PURE NOMEM READONLY NOSTACK
+PRESERVES_FLAGS NORETURN`, with `union` and `contains`. The instructions
+themselves are checked by the target's assembler, not here.
+
+```rust
+use hir_lang::AsmOptions;
+
+let o = AsmOptions::NOMEM.union(AsmOptions::NOSTACK);
+assert!(o.contains(AsmOptions::NOSTACK) && !o.contains(AsmOptions::PURE));
+```
 
 ## Patterns
 
@@ -860,13 +1145,14 @@ assert!(b.finish(root).is_ok());
 |---|---|
 | `Wild` | `_` |
 | `Bind { binder, mode, sub }` | bind (by value, `ref`, `ref mut`), optionally `x @ sub` |
+| `Ident { binder, path }` | a bare identifier: matches the constant/unit variant `path` resolves to, else binds `binder` (resolve-lang decides) |
 | `Lit(Lit)` | equality with a literal |
-| `Range { lo, hi, inclusive }` | at least one bound; bounds both integer, char, or float |
+| `Range { lo: Option<PatId>, hi: Option<PatId>, inclusive }` | at least one bound; each a `Lit` (integer, char, or float, one class) or a constant `Path` pattern |
 | `Tuple { elems, rest }`, `Ctor { path, elems, rest }` | `rest` = position of `..` (at most the element count) |
 | `Record { path, fields, rest }` | field names unique; no path = anonymous record |
 | `Path(PathId)` | unit variant, unit record, constant (`Pattern` namespace) |
 | `Slice { prefix, rest: Option<SliceRest> }` | `SliceRest { bind, suffix }` |
-| `Or(List<PatId>)` | non-empty; alternatives bind the same binders |
+| `Or(List<PatId>)` | non-empty; alternatives bind the same binders with the same modes |
 | `Ref { mutable, inner }` | `&p` |
 | `TypeTest { ty, pat }` | runtime/static type test (`catch (E e)`) |
 | `Err` | failed to lower |
@@ -896,17 +1182,29 @@ let root = b.module(None, &[f]);
 assert!(b.finish(root).is_ok());
 ```
 
-## Types and effect sets
+## Types, bounds, generic arguments, effect sets
 
 ### `Ty`
 
 `Infer`, `Prim(Prim)`, `Path(PathId)`, `Tuple(List<TyId>)`,
-`Array { elem, len }` (`len` a constant context), `Slice(TyId)`,
+`Array { elem, len }` (`len` an integer constant context), `Slice(TyId)`,
 `Ref { mutable, region: Option<PathId>, inner }`, `Ptr { mutable, inner }`,
-`Fn { params, ret, effects, throws }`, `Nullable(TyId)`, `Any` (gradual),
-`Object(List<TyId>)`, `Never`, `SelfTy`, `Const(ExprId)` (a constant generic
-argument), `Err`. Every annotation slot in HIR is optional; dynamic languages
-create no types at all.
+`Fn { params, ret, effects, throws, abi: Option<Symbol> }`, `Nullable(TyId)`,
+`Any` (gradual), `Object(List<Bound>)` (`dyn A + 'r`), `Impl(List<Bound>)`
+(opaque `impl A`), `Never`, `SelfTy`, `Err`. Every annotation slot in HIR is
+optional; dynamic languages create no types at all.
+
+### `Bound`
+
+`Ty(TyId)` or `Region(PathId)`: one bound of a generic parameter, a
+where-predicate, an associated type, a trait object, or an `impl` type.
+
+### `GenericArg`
+
+`Ty(TyId)`, `Const(ExprId)` (a constant context), `Region(PathId)`,
+`Binding { name: Ident, ty }` (`Iterator<Item = u8>`),
+`Constraint { name: Ident, bounds: List<Bound> }` (`Iterator<Item: Show>`).
+Used in path segments, method calls, intrinsics, and generic defaults.
 
 ### Effects
 
@@ -920,8 +1218,8 @@ pub const fn is_empty(self) -> bool
 ```rust
 use hir_lang::Effects;
 
-let fx = Effects::ASYNC.union(Effects::THROWS);
-assert!(fx.contains(Effects::THROWS) && !fx.contains(Effects::YIELD));
+let async_gen = Effects::ASYNC.union(Effects::YIELD);
+assert!(async_gen.contains(Effects::YIELD) && !async_gen.contains(Effects::THROWS));
 ```
 
 ## Names, binders, paths
@@ -935,35 +1233,92 @@ pub struct Binder { pub name: Name, pub kind: BinderKind, pub mutable: bool }
 `Binder::new(name, kind)`, `with_mutable(bool)`.
 `BinderKind = Local | Param | Capture | TypeParam | ConstParam | Region | Label`,
 with `is_value()` (`Local`, `Param`, `Capture`), `is_type_level()`
-(`TypeParam`, `ConstParam`, `Region`), and `name()`.
+(`TypeParam`, `ConstParam`, `Region`), `ns()` (the namespace a binder of that
+kind is referenced in; `None` for labels), and `name()`.
 
 ### `Path`
 
 ```rust,ignore
-pub struct Path { pub segments: List<Segment>, pub ns: Ns, pub res: Res, pub global: bool }
-pub struct Segment { pub name: Name, pub args: List<TyId>, pub origin: Origin }
+pub struct Path { pub segments: List<Segment>, pub ns: Ns, pub root: PathRoot,
+                  pub qself: Option<QSelf>, pub res: Res, pub unresolved: u32 }
+pub struct Segment { pub name: Name, pub args: List<GenericArg>, pub origin: Origin }
 ```
 
-At least one segment. `Segment::new(name, origin)` has no generic arguments.
+`Path::new(segments, ns)` is relative, unqualified, and unresolved;
+`Segment::new(name, origin)` has no generic arguments. The **error path** (no
+segments, `Res::Err`) is valid; any other path needs a segment. Shape rules
+for `unresolved`: at most the segment count; an empty resolved prefix only
+after a type root or a qualified self, with `res = Unresolved`; with a
+qualified self, the resolved prefix never extends past the trait.
+
+### `PathRoot`
+
+`Relative` (default), `Global` (`::a`), `SelfModule` (`self::`),
+`Super(u8)` (`super::` n times, n ≥ 1; PHP/Python `parent` imports),
+`SelfType` (`Self::`, PHP `self::`), `ParentType` (PHP `parent::`),
+`StaticType` (PHP `static::`, late static binding); `is_type_root()` for the
+last three.
+
+### `QSelf`
+
+`QSelf { ty: TyId, trait_len: u32 }`: `<T>::a` (`trait_len = 0`) or
+`<T as a::Tr>::b` (the first `trait_len` segments are the trait). Requires a
+relative root and at least one segment after the trait.
 
 ### `Ns`
 
-`Value` (expression paths, capture sources), `Type` (type paths, record
-expression/pattern paths), `Pattern` (constructor and constant patterns),
-`Region`, `Import`. Fixed by the parent node; `name()` spells it.
+`Value` (expression paths, capture sources, `global` declarations), `Type`
+(type paths, record expression/pattern paths), `Pattern` (constructor,
+constant, and identifier patterns), `Region`, `Import`. Fixed by the parent
+node; `name()` spells it.
 
 ### `Res`
 
-`Unresolved` (default), `Local(BinderId)`, `Item(ItemId)`, `Variant(VariantId)`,
-`Prim(Prim)`, `Err`; `is_unresolved()`. Allowed per namespace:
+`Unresolved` (default), `Local(BinderId)`, `Def(DefId)`, `Prim(Prim)`,
+`Extern(Symbol)` (a host/stdlib symbol), `Err`; `is_unresolved()`. Allowed
+for a full resolution, per namespace:
 
-| `ns` | `Local` kinds | `Item` kinds | `Variant` | `Prim` |
-|---|---|---|---|---|
-| `Value` | `Local` `Param` `Capture` `ConstParam` | `Fn` `Const` `Global` `Record` `Class` `Err` | yes | no |
-| `Type` | `TypeParam` | `Record` `Sum` `Class` `Interface` `Alias` `AssocType` `Err` | yes | yes |
-| `Pattern` | none | `Const` `Record` `Class` `Err` | yes | no |
-| `Region` | `Region` | none | no | no |
-| `Import` | none | all but `Impl` and `Import` | yes | no |
+| `ns` | `Local` kinds | this unit's `Def` items | `Def` variants | other units | `Prim` | `Extern` |
+|---|---|---|---|---|---|---|
+| `Value` | `Local` `Param` `Capture` `ConstParam` | `Fn` `Const` `Global` `Record` `Class` `Err` | yes | yes | no | yes |
+| `Type` | `TypeParam` | `Record` `Sum` `Class` `Interface` `Alias` `AssocType` `Err` | yes | yes | yes | yes |
+| `Pattern` | none | `Const` `Record` `Class` `Err` | yes | yes | no | yes |
+| `Region` | `Region` | none | no | no | no | no |
+| `Import` | none | all but `Impl`, `Import`, `MixinUse` | yes | yes | no | yes |
+
+A resolved **prefix** (`unresolved > 0`) may name a type parameter, a record,
+sum, class, interface, alias, associated type, module, or error item,
+another unit's definition, a primitive, or an extern; never a variant, never
+in `Region`.
+
+### `UnitId`
+
+`UnitId::new(u32)`, `as_u32()`, `Default` (unit 0). Host-assigned; unique
+among units that refer to each other, and stable across rebuilds.
+
+### `Def`
+
+`Item(ItemId)` or `Variant(VariantId)`.
+
+### `DefId`
+
+```rust,ignore
+pub struct DefId { /* unit, def, private tag */ }
+pub const fn foreign(unit: UnitId, def: Def) -> DefId   // untagged
+pub const fn unit(self) -> UnitId
+pub const fn def(self) -> Def
+```
+
+Equality, ordering, and hashing compare `unit` and `def` only.
+
+```rust
+use hir_lang::{Def, DefId, ItemId, Res, UnitId};
+
+// a reference into another unit: accepted as is, checked by the host
+let other = DefId::foreign(UnitId::new(9), Def::Item(ItemId::from_index(3).unwrap()));
+assert_eq!(other.unit(), UnitId::new(9));
+let _res = Res::Def(other);
+```
 
 ## Literals and primitive types
 
@@ -979,7 +1334,8 @@ expression/pattern paths), `Pattern` (constructor and constant patterns),
 optional `-`).
 
 - `IntLit { value: u64, negative: bool, suffix: Option<Prim> }`: `IntLit::new`,
-  `IntLit::signed(i64)`, `with_suffix`, `fits(Prim)`. A suffixed literal must fit.
+  `IntLit::signed(i64)`, `with_suffix`, `fits(Prim)`. A suffixed literal must
+  fit; `-0` (`value = 0, negative`) is invalid.
 - `FloatLit { bits: u64, suffix: Option<Prim> }`: `FloatLit::new(f64)`,
   `with_suffix`, `value`, `is_exact` (an `f32` literal must be exact in `f32`).
 
@@ -1035,6 +1391,13 @@ pub struct Policy { pub overflow: Option<Overflow>, pub div_zero: Option<DivZero
 `Overflow = Error | Wrap | Trap | Promote`, `DivZero = Error | Trap`,
 `Shift = Error | Mask`, `FloatToInt = Error | Saturate`.
 
+`Overflow::Promote` (OPS §2, Mox/PHP): when the exact integer result is not
+representable, the result is the `f64` nearest the exact mathematical result;
+`div` with `promote` yields the exact quotient as `f64` whenever the division
+is inexact or overflows. It needs a dynamically typed result: the validator
+rejects it (`PromoteOnStaticResult`) on `int_cast<T>`, on a cast to anything
+but `Any`, and directly inside an integer constant context.
+
 ```rust
 use hir_lang::{Op, OpKind, Overflow, Policy};
 
@@ -1075,7 +1438,8 @@ A run of the text pool: `from_raw`, `start`, `len`, `is_empty`.
 
 The sealed trait of list element types: every id that appears in lists and
 `Arg`, `FieldInit`, `MapEntry`, `Arm`, `Capture`, `GenericParam`, `WherePred`,
-`Segment`, `FieldPat`, `Attr`, `AttrArg`.
+`Segment`, `GenericArg`, `Bound`, `FieldPat`, `Attr`, `AttrArg`, `AsmOperand`,
+`MixinRule`.
 
 ## Origins
 
@@ -1105,9 +1469,24 @@ argument, attribute) with its own span; no mark.
 
 ## Traversal
 
-`Event = Enter(NodeRef) | Leave(NodeRef)` (`node()`), and
-`Control = Continue | Skip | Stop` (`Skip` skips the children of the entered
-node; its `Leave` still arrives).
+### `Event`
+
+`#[non_exhaustive]`: `Enter(NodeRef)`, `Leave(NodeRef)`, `ScopeOpen`,
+`ScopeClose`, `Bind(BinderId)` (the binder becomes visible here and stays
+visible until the `ScopeClose` matching the innermost `ScopeOpen` around it),
+`FrameOpen(Frame)`, `FrameClose`; `node()` returns the node of an
+`Enter`/`Leave`.
+
+### `Frame`
+
+`#[non_exhaustive]`: `Item(ItemId)`, `Closure(ExprId)`, `Default(ParamId)`,
+`Const` (array length, const argument, discriminant, field default).
+
+### `Control`
+
+`Continue | Skip | Stop`. `Skip` skips the children of the entered node (its
+`Leave` still arrives, and the scope and frame events of the skipped subtree
+are not delivered).
 
 ```rust
 use hir_lang::{Builder, Control, Event, NodeRef};
@@ -1133,10 +1512,14 @@ assert_eq!(entered, 2); // the module and the skipped fn
 ## Printing
 
 One node per line: `(kind inline-data`, children indented two spaces, `)`
-appended at the node's end. Paths print inline on their parent's line;
-binders print as `name%id`, marks as `'eN`, resolutions as `→ local x%3`,
-`→ item 4`, `→ variant 2`, `→ prim i32`; non-node children appear as groups
-(`(arm …)`, `(guard …)`, `(arg name …)`, `(capture x%2 by-value …)`).
+appended at the node's end. A path prints inline when it directly follows its
+parent's header, else on its own line; roots print as `::`, `self::`,
+`super::`, `Self::`, `parent::`, `static::`, qualified selves as `<…>::`.
+Binders print as `name%id`, marks as `'eN`, resolutions as `→ local x%3`,
+`→ item 4`, `→ variant 2`, `→ item u7:3` (another unit), `→ prim i32`,
+`→ extern name`, with ` +N` for unresolved segments. Non-node children
+appear as groups (`(arm …)`, `(guard …)`, `(arg name …)`, `(arg place …)`,
+`(capture x%2 by-value …)`, `(binding …)`, `(operand …)`, `(rule …)`).
 Indentation stops growing after 64 levels, so the output is linear in the node
 count at any depth. The output is identical on every platform.
 
@@ -1166,7 +1549,8 @@ assert_eq!(
 
 ### `HirError`
 
-`#[non_exhaustive]`. Each variant names its site.
+`#[non_exhaustive]`. Each variant names its site; `node()` returns the node
+it is about, when there is one.
 
 | Variant | Meaning | What to do |
 |---|---|---|
@@ -1175,23 +1559,23 @@ assert_eq!(
 | `ListOutOfBounds { site }`, `TextOutOfBounds { site }` | a list/text range lies outside its pool | same |
 | `ExpansionOrder { expn }` | an expansion refers to itself or a later one | record parents first |
 | `RootNotModule` | the root is not a module | |
-| `SharedNode { node }` | a node has two parents (or is its own ancestor) | build a fresh node per use |
-| `Unreachable { node }` | a node is not in the tree | attach or drop it |
+| `SharedNode { node }` | a node has two parents (or is its own ancestor) | build a fresh node per use, or `copy_subtree` |
+| `Unreachable { node }` | a live node is not in the tree | attach or drop it |
 | `Malformed { site, problem: Malformed }` | a node's own shape is wrong | see below |
-| `DuplicateName { node, name }` | two members of one list share a name | |
+| `DuplicateName { node, name, index }` | two members of one list share a name; `index` is the first repetition in list order | |
 | `Policy { expr }` | an op/cast/compound assignment lacks or has extra policy fields | use `Op::new` defaults |
 | `Arity { expr, expected, found }` | wrong operand count | |
-| `BinderNotBound { binder }` | a binder has no binding site | |
 | `BinderBoundTwice { binder, node }` | bound by two constructs | |
 | `DuplicateBinding { binder, pat }` | bound twice in one pattern alternative | |
 | `OrPatternBinders { pat }` | alternatives bind different sets | |
 | `BinderKind { binder, expected }` | kind does not fit the site | |
 | `PathNamespace { path, expected }` | namespace does not match the parent | |
-| `Resolution { path, res }` | the namespace cannot name `res` | |
+| `Resolution { path, res }` | the namespace (or a prefix) cannot name `res` | |
+| `ForeignDef { path }` | a `DefId` claims this unit but was minted by another `Hir` | mint ids with this `Hir`'s `def` |
 | `OutOfScope { path, binder }` | binder not in scope at the path | |
-| `NotCapturable { path, binder }` | binder behind a nested item, a constant context, or a non-capturing closure | |
-| `Jump { expr, problem: JumpProblem }` | `BreakOutsideLoop`, `ContinueOutsideLoop`, `LabelNotInScope`, `ContinueToBlock`, `OutOfDefer` | |
-| `Effect { expr, problem: EffectProblem }` | `ReturnOutsideFunction`, `AwaitOutsideAsync`, `YieldOutsideGenerator`, `ThrowNotAllowed` | declare the effect or wrap in `try` |
+| `NotCapturable { path, binder }` | binder behind a nested item, a constant context, a non-capturing closure, or a once-evaluated default | |
+| `Jump { expr, problem: JumpProblem }` | `BreakOutsideLoop`, `ContinueOutsideLoop`, `LabelNotInScope`, `ContinueToBlock`, `OutOfDefer`, `ContinueInStep` | |
+| `Effect { expr, problem: EffectProblem }` | `ReturnOutsideFunction`, `AwaitOutsideAsync`, `YieldOutsideGenerator`, `ThrowNotAllowed`, `YieldInCleanup` | declare the effect, wrap in `try`, or move the `yield` |
 
 ### `Malformed`
 
@@ -1201,14 +1585,9 @@ assert_eq!(
 `AssignTarget`, `CompoundAssignOp`, `LetElseWithoutInit`, `ShapeFields`,
 `MissingName`, `UnexpectedName`, `MissingBody`, `MissingConstValue`,
 `ItemPlacement`, `ReceiverPlacement`, `ParamOrder`, `ParamDefault`,
-`InferCapture`, `EmptyAttrArg`, `AttrOrder`, `PromoteOnStaticResult`.
-
-`Overflow::Promote` (OPS §2, for Mox/PHP: an overflowing integer result becomes
-the nearest `f64`) needs a dynamically typed result. The validator rejects it
-with `PromoteOnStaticResult` where HIR fixes a static result type: on
-`int_cast<T>`, on a cast to anything but `Any`, and directly inside an integer
-constant context (array length, const generic argument, discriminant). Static
-results known only after inference are typeck-lang's to reject.
+`InferCapture`, `EmptyAttrArg`, `AttrOrder`, `PromoteOnStaticResult`,
+`PathShape`, `RangeBound`, `NegativeZero`, `AsmTemplate`, `AsmOperand`,
+`IntrinsicArity`, `MemOrder`, `PlaceArg`, `AppendContext`, `OrPatternModes`.
 
 ### `Site`, `Capacity`, `JumpProblem`, `EffectProblem`
 
@@ -1218,10 +1597,10 @@ results known only after inference are typeck-lang's to reject.
 error types implement `Display`; `HirError` implements `core::error::Error`.
 
 ```rust
-use hir_lang::{Builder, Expr, HirError, List, Malformed, Ns, Path, Res};
+use hir_lang::{Builder, Expr, HirError, List, Malformed, Ns, Path};
 
 let mut b = Builder::new();
-let empty = b.path(Path { segments: List::EMPTY, ns: Ns::Value, res: Res::Unresolved, global: false });
+let empty = b.path(Path::new(List::EMPTY, Ns::Value)); // no segments, not the error path
 let e = b.expr(Expr::Path(empty));
 let body = b.block(&[], Some(e));
 let f = b.func(hir_lang::Name::new(intern_lang::Interner::new().intern("f")), &[], body);
@@ -1250,13 +1629,15 @@ assert_eq!(err.to_string(), "path 0: a path has no segments");
 |---|---|---|
 | Entries per arena, pool, or the text pool | `u32::MAX - 1` | `CapacityExceeded` |
 | Total nodes across arenas | `u32::MAX - 1` | `CapacityExceeded { what: Total }` |
+| Lenient repair rounds | 16; past that, a last resort empties the root module (every other node becomes a dead error node) so the result is still valid | — |
 | Nesting depth | none (every algorithm is iterative) | — |
 
 ## Stability
 
-Pre-1.0. The node forms are deliberately **not** `#[non_exhaustive]`: every
-consumer must handle every form, and a new form is a breaking change for all of
-them regardless. Error enums and `PrintOptions` are `#[non_exhaustive]`. The
-canonical order and the printed form are part of the contract (snapshot tests
-depend on them). The 0.5 textual syntax and binary encoding (spec §20–§21) are
-additive.
+Pre-1.0; 0.3 broke 0.2 (see the CHANGELOG for the migration list). The node
+forms are deliberately **not** `#[non_exhaustive]`: every consumer must handle
+every form, and a new form is a breaking change for all of them regardless.
+`Intrinsic`, `Event`, `Frame`, the error enums, and `PrintOptions` are
+`#[non_exhaustive]`. The canonical order and the printed form are part of the
+contract (snapshot tests depend on them). The 0.5 body graph, textual syntax,
+and binary encoding (spec §19–§21) are additive.

@@ -100,13 +100,24 @@ pub enum Pat {
     },
     /// Equal to a literal.
     Lit(Lit),
-    /// Within a literal range; at least one bound, both of one class
-    /// (integer, char, or float).
+    /// A bare identifier whose meaning resolve-lang decides: if `path`
+    /// resolves to a constant, unit variant, or unit record, the pattern
+    /// matches that value; otherwise (unresolved or `Err`) it binds `binder`.
+    /// Structurally it always counts as `binder`'s binding site.
+    Ident {
+        /// The binder (kind `Local` or `Param` by site).
+        binder: BinderId,
+        /// The same name as a `Pattern`-namespace path.
+        path: PathId,
+    },
+    /// Within a range. Each bound is a child pattern that is a `Lit` or a
+    /// `Path` (a constant); at least one bound; literal bounds are of one
+    /// class (integer, char, or float).
     Range {
         /// Lower bound, inclusive.
-        lo: Option<Lit>,
+        lo: Option<PatId>,
         /// Upper bound.
-        hi: Option<Lit>,
+        hi: Option<PatId>,
         /// `..=` rather than `..`.
         inclusive: bool,
     },

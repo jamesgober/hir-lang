@@ -71,6 +71,19 @@ impl Kit {
         self.b.finish(root)
     }
 
+    /// Like `finish_body`, keeping the interner for printing.
+    pub fn finish_body_keep(mut self, body: ExprId) -> (Result<Hir, HirError>, Interner) {
+        let f = self.func_fx("main", &[], Effects::NONE, body);
+        let root = self.b.module(None, &[f]);
+        (self.b.finish(root), self.names)
+    }
+
+    /// Like `finish_items`, keeping the interner for printing.
+    pub fn finish_items_keep(mut self, items: &[ItemId]) -> (Result<Hir, HirError>, Interner) {
+        let root = self.b.module(None, items);
+        (self.b.finish(root), self.names)
+    }
+
     /// Finishes with the given items in a root module.
     pub fn finish_items(mut self, items: &[ItemId]) -> Result<Hir, HirError> {
         let root = self.b.module(None, items);

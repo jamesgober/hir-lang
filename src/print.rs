@@ -11,11 +11,15 @@ use core::fmt::{self, Write};
 use intern_lang::{Lookup, Symbol};
 
 use crate::{
-    expr::{ArgKind, BorrowKind, CaptureMode, Expr, Member, Stmt},
+    def::{Def, UnitId},
+    expr::{Arg, ArgKind, BorrowKind, CaptureMode, Expr, Member, Stmt},
     hir::Hir,
     id::{BinderId, NodeRef},
+    intrinsic::{AsmDir, Intrinsic, MemOrder, RmwOp},
+    item::MixinAction,
     item::{AttrValue, ItemKind, ParamKind, Shape, Vis},
     lit::Lit,
+    name::PathRoot,
     name::{Res, Segment},
     ops::{DivZero, FloatToInt, Op, Overflow, Policy, Shift},
     origin::{ExpnId, Name, Origin},
@@ -150,11 +154,13 @@ pub fn print_into<L: Lookup, W: Write>(
 ) -> fmt::Result {
     let mut p = Printer {
         s: hir.store(),
+        unit: hir.unit(),
         names,
         options,
         out,
         depth: 0,
         first: true,
+        at_header: false,
         groups: Vec::new(),
     };
     p.run(NodeRef::Item(hir.root()))
@@ -162,11 +168,14 @@ pub fn print_into<L: Lookup, W: Write>(
 
 struct Printer<'a, L, W> {
     s: &'a Store,
+    unit: UnitId,
     names: &'a L,
     options: PrintOptions,
     out: &'a mut W,
     depth: usize,
     first: bool,
+    /// Nothing has been printed since the last header: a path goes inline.
+    at_header: bool,
     /// For each open group: whether it printed a bracket.
     groups: Vec<bool>,
 }
@@ -187,12 +196,14 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 Step::Leave(_) => {
                     self.depth = self.depth.saturating_sub(1);
                     self.out.write_char(')')?;
+                    self.at_header = false;
                 }
                 Step::Mark(Mark::Open(group)) => self.open_group(group)?,
                 Step::Mark(Mark::Close) => {
                     if self.groups.pop().unwrap_or(false) {
                         self.depth = self.depth.saturating_sub(1);
                         self.out.write_char(')')?;
+                        self.at_header = false;
                     }
                 }
                 Step::Mark(_) => {}
@@ -214,8 +225,8 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
     }
 
     fn open_node(&mut self, node: NodeRef) -> fmt::Result {
-        if matches!(node, NodeRef::Path(_)) {
-            // Paths print on their parent's line.
+        if matches!(node, NodeRef::Path(_)) && self.at_header {
+            // A path right after its parent's header prints on that line.
             self.out.write_str(" (")?;
         } else {
             self.line()?;
@@ -251,11 +262,19 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
             }
         }
         self.depth += 1;
+        self.at_header = true;
         Ok(())
     }
 
     fn open_group(&mut self, group: Group) -> fmt::Result {
-        if matches!(group, Group::Arg(ArgKind::Positional)) {
+        if matches!(
+            group,
+            Group::Arg(Arg {
+                kind: ArgKind::Positional,
+                place: false,
+                ..
+            })
+        ) {
             self.groups.push(false);
             return Ok(());
         }
@@ -284,24 +303,66 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 self.sym(name.sym)?;
             }
             Group::Entry => self.out.write_str("entry")?,
-            Group::Arg(kind) => match kind {
-                ArgKind::Named(name) => {
-                    self.out.write_str("arg ")?;
-                    self.sym(name.sym)?;
+            Group::Arg(arg) => {
+                match arg.kind {
+                    ArgKind::Named(name) => {
+                        self.out.write_str("arg ")?;
+                        self.sym(name.sym)?;
+                    }
+                    ArgKind::Spread => self.out.write_str("spread")?,
+                    ArgKind::SpreadNamed => self.out.write_str("spread-named")?,
+                    ArgKind::Positional => self.out.write_str("arg")?,
                 }
-                ArgKind::Spread => self.out.write_str("spread")?,
-                ArgKind::SpreadNamed => self.out.write_str("spread-named")?,
-                ArgKind::Positional => {}
-            },
+                if arg.place {
+                    self.out.write_str(" place")?;
+                }
+            }
             Group::FieldPat(name) => {
                 self.out.write_str("field ")?;
                 self.sym(name.sym)?;
             }
             Group::SliceRest => self.out.write_str("rest")?,
             Group::SegmentArgs(i) => write!(self.out, "args {i}")?,
+            Group::Binding(name) => {
+                self.out.write_str("binding ")?;
+                self.sym(name.sym)?;
+            }
+            Group::Constraint(name) => {
+                self.out.write_str("constraint ")?;
+                self.sym(name.sym)?;
+            }
+            Group::AsmOperand(op) => {
+                let dir = match op.dir {
+                    AsmDir::In => "in",
+                    AsmDir::Out => "out",
+                    AsmDir::InOut => "inout",
+                    AsmDir::Const => "const",
+                    AsmDir::Sym => "sym",
+                };
+                let text = text_of(self.s, op.constraint);
+                write!(self.out, "{dir} {:?}", text)?;
+            }
+            Group::MixinRule(rule) => {
+                self.out.write_str("rule ")?;
+                self.sym(rule.method.sym)?;
+                match rule.action {
+                    MixinAction::Insteadof(_) => self.out.write_str(" insteadof")?,
+                    MixinAction::Alias { name, vis } => {
+                        self.out.write_str(" as")?;
+                        if let Some(v) = vis {
+                            self.out.write_str(vis_name(v))?;
+                        }
+                        if let Some(n) = name {
+                            self.out.write_char(' ')?;
+                            self.sym(n.sym)?;
+                        }
+                    }
+                }
+            }
         }
         self.groups.push(true);
         self.depth += 1;
+        self.at_header = true;
         Ok(())
     }
 
@@ -451,6 +512,37 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
         Ok(())
     }
 
+    fn intrinsic(&mut self, kind: Intrinsic) -> fmt::Result {
+        match kind {
+            Intrinsic::AtomicLoad(o) => write!(self.out, "atomic_load {}", order_name(o)),
+            Intrinsic::AtomicStore(o) => write!(self.out, "atomic_store {}", order_name(o)),
+            Intrinsic::AtomicRmw(op, o) => {
+                let op = match op {
+                    RmwOp::Xchg => "xchg",
+                    RmwOp::Add => "add",
+                    RmwOp::Sub => "sub",
+                    RmwOp::And => "and",
+                    RmwOp::Or => "or",
+                    RmwOp::Xor => "xor",
+                    RmwOp::Nand => "nand",
+                    RmwOp::Min => "min",
+                    RmwOp::Max => "max",
+                };
+                write!(self.out, "atomic_rmw {op} {}", order_name(o))
+            }
+            Intrinsic::AtomicCmpXchg { success, failure } => write!(
+                self.out,
+                "atomic_cmpxchg {} {}",
+                order_name(success),
+                order_name(failure)
+            ),
+            Intrinsic::Fence(o) => write!(self.out, "fence {}", order_name(o)),
+            Intrinsic::VolatileLoad => self.out.write_str("volatile_load"),
+            Intrinsic::VolatileStore => self.out.write_str("volatile_store"),
+            Intrinsic::Named(sym) => self.sym(sym),
+        }
+    }
+
     fn label(&mut self, label: Option<BinderId>) -> fmt::Result {
         if let Some(l) = label {
             self.out.write_str(" '")?;
@@ -471,11 +563,7 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                         self.out.write_char(' ')?;
                         self.name(name)?;
                     }
-                    match item.vis {
-                        Vis::Private => {}
-                        Vis::Package => self.out.write_str(" package")?,
-                        Vis::Public => self.out.write_str(" pub")?,
-                    }
+                    self.out.write_str(vis_name(item.vis))?;
                     self.item_details(&item.kind)
                 }
                 None => self.out.write_str("?"),
@@ -484,14 +572,26 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 Some(expr) => self.expr_header(*expr),
                 None => self.out.write_str("?"),
             },
-            NodeRef::Stmt(id) => self.out.write_str(match self.s.stmt(id) {
-                Some(Stmt::Let { .. }) => "let",
-                Some(Stmt::Expr(_)) => "do",
-                Some(Stmt::Item(_)) => "decl",
-                Some(Stmt::Defer(_)) => "defer",
-                Some(Stmt::Err) => "error",
-                None => "?",
-            }),
+            NodeRef::Stmt(id) => match self.s.stmt(id) {
+                Some(Stmt::Static { binder, .. }) => {
+                    let binder = *binder;
+                    self.out.write_str("static ")?;
+                    self.binder(binder)
+                }
+                Some(Stmt::Global { binder, .. }) => {
+                    let binder = *binder;
+                    self.out.write_str("global ")?;
+                    self.binder(binder)
+                }
+                other => self.out.write_str(match other {
+                    Some(Stmt::Let { .. }) => "let",
+                    Some(Stmt::Expr(_)) => "do",
+                    Some(Stmt::Item(_)) => "decl",
+                    Some(Stmt::Defer(_)) => "defer",
+                    Some(Stmt::Err) => "error",
+                    _ => "?",
+                }),
+            },
             NodeRef::Pat(id) => match self.s.pat(id) {
                 Some(pat) => self.pat_header(*pat),
                 None => self.out.write_str("?"),
@@ -504,8 +604,21 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 Some(path) => {
                     let path = *path;
                     self.out.write_str("path ")?;
-                    if path.global {
-                        self.out.write_str("::")?;
+                    match path.root {
+                        PathRoot::Relative => {}
+                        PathRoot::Global => self.out.write_str("::")?,
+                        PathRoot::SelfModule => self.out.write_str("self::")?,
+                        PathRoot::Super(n) => {
+                            for _ in 0..n {
+                                self.out.write_str("super::")?;
+                            }
+                        }
+                        PathRoot::SelfType => self.out.write_str("Self::")?,
+                        PathRoot::ParentType => self.out.write_str("parent::")?,
+                        PathRoot::StaticType => self.out.write_str("static::")?,
+                    }
+                    if path.qself.is_some() {
+                        self.out.write_str("<qself>::")?;
                     }
                     let segments: Vec<Segment> = self.s.list(path.segments).to_vec();
                     for (i, seg) in segments.iter().enumerate() {
@@ -514,7 +627,14 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                         }
                         self.name(seg.name)?;
                     }
-                    self.res(path.res)
+                    if path.segments.is_empty() {
+                        self.out.write_str("<error>")?;
+                    }
+                    self.res(path.res)?;
+                    if path.unresolved > 0 {
+                        write!(self.out, " +{}", path.unresolved)?;
+                    }
+                    Ok(())
                 }
                 None => self.out.write_str("?"),
             },
@@ -526,12 +646,7 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                         self.out.write_char(' ')?;
                         self.sym(name.sym)?;
                     }
-                    if field.vis == Vis::Public {
-                        self.out.write_str(" pub")?;
-                    } else if field.vis == Vis::Package {
-                        self.out.write_str(" package")?;
-                    }
-                    Ok(())
+                    self.out.write_str(vis_name(field.vis))
                 }
                 None => self.out.write_str("?"),
             },
@@ -554,7 +669,11 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                         ParamKind::NamedOnly => "named-only",
                         ParamKind::RestNamed => "rest-named",
                     };
-                    write!(self.out, "param {kind}")
+                    write!(self.out, "param {kind}")?;
+                    if param.by_ref {
+                        self.out.write_str(" by-ref")?;
+                    }
+                    Ok(())
                 }
                 None => self.out.write_str("?"),
             },
@@ -568,8 +687,21 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 self.out.write_str(" → local ")?;
                 self.binder(b)
             }
-            Res::Item(i) => write!(self.out, " → item {}", i.index()),
-            Res::Variant(v) => write!(self.out, " → variant {}", v.index()),
+            Res::Def(def) => {
+                let (what, index) = match def.def() {
+                    Def::Item(i) => ("item", i.index()),
+                    Def::Variant(v) => ("variant", v.index()),
+                };
+                if def.unit() == self.unit {
+                    write!(self.out, " → {what} {index}")
+                } else {
+                    write!(self.out, " → {what} u{}:{index}", def.unit().as_u32())
+                }
+            }
+            Res::Extern(sym) => {
+                self.out.write_str(" → extern ")?;
+                self.sym(sym)
+            }
             Res::Prim(p) => write!(self.out, " → prim {}", p.name()),
             Res::Err => self.out.write_str(" → error"),
         }
@@ -578,6 +710,9 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
     fn item_details(&mut self, kind: &ItemKind) -> fmt::Result {
         match kind {
             ItemKind::Fn(f) => {
+                if f.defaults == crate::expr::DefaultEval::Once {
+                    self.out.write_str(" defaults=once")?;
+                }
                 self.effects(f.effects)?;
                 if let Some(abi) = f.abi {
                     self.out.write_str(" abi=")?;
@@ -585,8 +720,18 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 }
                 Ok(())
             }
-            ItemKind::Record(r) => self.out.write_str(shape(r.shape)),
+            ItemKind::Record(r) => {
+                self.out.write_str(shape(r.shape))?;
+                if r.is_union {
+                    self.out.write_str(" union")?;
+                }
+                Ok(())
+            }
+            ItemKind::Module { effects, .. } => self.effects(*effects),
             ItemKind::Class(c) => {
+                if c.mixin {
+                    self.out.write_str(" mixin")?;
+                }
                 if c.is_abstract {
                     self.out.write_str(" abstract")?;
                 }
@@ -626,6 +771,19 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 }
             }
             Expr::Index { .. } => self.out.write_str("index"),
+            Expr::DynField { .. } => self.out.write_str("dyn-field"),
+            Expr::DynMethodCall { .. } => self.out.write_str("dyn-method"),
+            Expr::VarVar(_) => self.out.write_str("var-var"),
+            Expr::Append(_) => self.out.write_str("append"),
+            Expr::RefAssign { .. } => self.out.write_str("ref-assign"),
+            Expr::Asm(asm) => {
+                let text = text_of(self.s, asm.template);
+                write!(self.out, "asm {:?}", text)
+            }
+            Expr::Intrinsic { kind, .. } => {
+                self.out.write_str("intrinsic ")?;
+                self.intrinsic(kind)
+            }
             Expr::Op { op, .. } => {
                 self.out.write_str("op ")?;
                 self.op(op)
@@ -676,6 +834,13 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 self.out.write_str("closure implicit=")?;
                 self.out
                     .write_str(c.implicit.map_or("none", capture_mode))?;
+                if let Some(me) = c.self_binder {
+                    self.out.write_str(" self=")?;
+                    self.binder(me)?;
+                }
+                if c.defaults == crate::expr::DefaultEval::Once {
+                    self.out.write_str(" defaults=once")?;
+                }
                 self.effects(c.effects)
             }
             Expr::Throw(_) => self.out.write_str("throw"),
@@ -703,16 +868,13 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                 self.out.write_str("lit ")?;
                 self.lit(lit)
             }
-            Pat::Range { lo, hi, inclusive } => {
-                self.out.write_str("range ")?;
-                if let Some(lo) = lo {
-                    self.lit(lo)?;
-                }
-                self.out.write_str(if inclusive { "..=" } else { ".." })?;
-                if let Some(hi) = hi {
-                    self.lit(hi)?;
-                }
-                Ok(())
+            Pat::Ident { binder, .. } => {
+                self.out.write_str("ident ")?;
+                self.binder(binder)
+            }
+            Pat::Range { inclusive, .. } => {
+                self.out
+                    .write_str(if inclusive { "range ..=" } else { "range .." })
             }
             Pat::Tuple { rest, .. } => {
                 self.out.write_str("tuple")?;
@@ -751,8 +913,12 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
                     .write_str(if mutable { "ref-type mut" } else { "ref-type" })
             }
             Ty::Ptr { mutable, .. } => self.out.write_str(if mutable { "ptr mut" } else { "ptr" }),
-            Ty::Fn { effects, .. } => {
+            Ty::Fn { effects, abi, .. } => {
                 self.out.write_str("fn-type")?;
+                if let Some(abi) = abi {
+                    self.out.write_str(" abi=")?;
+                    self.sym(abi)?;
+                }
                 self.effects(effects)
             }
             Ty::Nullable(_) => self.out.write_str("nullable"),
@@ -760,9 +926,33 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
             Ty::Object(_) => self.out.write_str("object"),
             Ty::Never => self.out.write_str("never"),
             Ty::SelfTy => self.out.write_str("self-type"),
-            Ty::Const(_) => self.out.write_str("const-arg"),
+            Ty::Impl(_) => self.out.write_str("impl"),
             Ty::Err => self.out.write_str("error"),
         }
+    }
+}
+
+fn text_of(store: &Store, t: crate::id::TextRef) -> &str {
+    let bytes = t.range().and_then(|r| store.text.get(r)).unwrap_or(&[]);
+    core::str::from_utf8(bytes).unwrap_or("")
+}
+
+fn vis_name(vis: Vis) -> &'static str {
+    match vis {
+        Vis::Private => "",
+        Vis::Protected => " protected",
+        Vis::Package => " package",
+        Vis::Public => " pub",
+    }
+}
+
+fn order_name(o: MemOrder) -> &'static str {
+    match o {
+        MemOrder::Relaxed => "relaxed",
+        MemOrder::Acquire => "acquire",
+        MemOrder::Release => "release",
+        MemOrder::AcqRel => "acq_rel",
+        MemOrder::SeqCst => "seq_cst",
     }
 }
 

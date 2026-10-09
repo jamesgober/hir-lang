@@ -12,11 +12,12 @@ use crate::{
         BinderId, ExprId, FieldId, ItemId, List, NodeRef, ParamId, PatId, PathId, StmtId, TyId,
         VariantId,
     },
-    item::{Attr, AttrArg, FieldDef, GenericParam, Item, Param, Variant, WherePred},
+    intrinsic::AsmOperand,
+    item::{Attr, AttrArg, FieldDef, GenericParam, Item, MixinRule, Param, Variant, WherePred},
     name::{Binder, Path, Segment},
     origin::{Expansion, Origin},
     pat::{FieldPat, Pat},
-    ty::Ty,
+    ty::{Bound, GenericArg, Ty},
 };
 
 /// Nodes of one kind plus their origins, index-aligned.
@@ -89,6 +90,10 @@ pub struct Store {
     pub(crate) pool_field_pat: Vec<FieldPat>,
     pub(crate) pool_attr: Vec<Attr>,
     pub(crate) pool_attr_arg: Vec<AttrArg>,
+    pub(crate) pool_generic_arg: Vec<GenericArg>,
+    pub(crate) pool_bound: Vec<Bound>,
+    pub(crate) pool_asm_operand: Vec<AsmOperand>,
+    pub(crate) pool_mixin_rule: Vec<MixinRule>,
 }
 
 impl Store {
@@ -103,6 +108,23 @@ impl Store {
     #[inline]
     pub(crate) fn list<T: Pooled>(&self, list: List<T>) -> &[T] {
         self.try_list(list).unwrap_or(&[])
+    }
+
+    /// Copies `elems` into their pool; `None` if the pool would outgrow
+    /// `u32` indexes.
+    pub(crate) fn push_list<T: Pooled>(&mut self, elems: &[T]) -> Option<List<T>> {
+        if elems.is_empty() {
+            return Some(List::EMPTY);
+        }
+        let pool = T::pool_mut(self);
+        let start = pool.len();
+        let end = start.checked_add(elems.len())?;
+        if end > crate::id::MAX_LEN {
+            return None;
+        }
+        let list = List::from_raw(u32::try_from(start).ok()?, u32::try_from(elems.len()).ok()?);
+        pool.extend_from_slice(elems);
+        Some(list)
     }
 
     #[inline]
@@ -212,7 +234,7 @@ mod sealed {
 /// appear in a [`List`].
 ///
 /// Implemented for every id type that appears in lists and for the list record
-/// types ([`Arg`], [`Arm`], [`Segment`], ...). Sealed: the set of pools is part
+/// types ([`Arg`], [`Arm`], [`Segment`], [`GenericArg`], [`Bound`], ...). Sealed: the set of pools is part
 /// of the HIR definition.
 ///
 /// # Examples
@@ -269,4 +291,8 @@ pooled! {
     FieldPat => pool_field_pat,
     Attr => pool_attr,
     AttrArg => pool_attr_arg,
+    GenericArg => pool_generic_arg,
+    Bound => pool_bound,
+    AsmOperand => pool_asm_operand,
+    MixinRule => pool_mixin_rule,
 }
