@@ -16,7 +16,7 @@ use crate::{
     id::{BinderId, ExprId, ItemId, List, NodeRef, ParamId, PatId, StmtId, TyId},
     intrinsic::AsmOperand,
     item::{GenericParam, Generics, ItemKind, MixinRule},
-    name::Ns,
+    name::{BinderKind, Ns},
     origin::Ident,
     pat::Pat,
     store::Store,
@@ -87,8 +87,9 @@ pub(crate) enum Mark {
     Generics(List<GenericParam>),
     /// The binders of a construct's root pattern become visible.
     Bind(BindSite, PatId),
-    /// A declaration's binder (`static`, `global`) becomes visible.
-    BindDecl(BinderId),
+    /// A declaration's binder (`static`, `global`, a `let_place` alias)
+    /// becomes visible; the kind its site requires.
+    BindDecl(BinderId, BinderKind),
     /// The explicit captures' binders become visible.
     Captures(List<Capture>),
     /// A closure's self binder becomes visible.
@@ -105,13 +106,9 @@ pub(crate) enum Mark {
     StepEnd,
     Try,
     PopTry,
-    /// A `defer` body: no jump may leave it, no `yield` inside.
+    /// A `defer` body: no jump may leave it, no `return` inside.
     Defer,
     PopDefer,
-    /// A `finally` body: jumps may leave it (overriding the pending
-    /// completion), no `yield` inside.
-    Finally,
-    PopFinally,
     /// The next node is a path in this namespace.
     ExpectNs(Ns),
     Open(Group),
@@ -583,8 +580,24 @@ impl Expander<'_> {
                 self.mark(Mark::PopLoop);
                 self.mark(Mark::PopScope);
             }
-            Expr::Break { value, .. } | Expr::Return(value) | Expr::Yield(value) => {
+            Expr::Break { value, .. } | Expr::Return(value) => self.opt_expr(value),
+            Expr::Yield { key, value } => {
+                if let Some(k) = key {
+                    self.tagged_expr("key", k);
+                }
                 self.opt_expr(value);
+            }
+            Expr::YieldFrom(x) => self.expr_node(x),
+            Expr::LetPlace {
+                binder,
+                place,
+                body,
+            } => {
+                self.expr_node(place);
+                self.mark(Mark::Scope);
+                self.mark(Mark::BindDecl(binder, BinderKind::Place));
+                self.expr_node(body);
+                self.mark(Mark::PopScope);
             }
             Expr::Closure(c) => {
                 for cap in self.s.list(c.captures) {
@@ -617,11 +630,7 @@ impl Expander<'_> {
                 self.mark(Mark::PopTry);
                 self.arms(catches, Group::Catch);
                 if let Some(f) = finally {
-                    self.open(Group::Tag("finally"));
-                    self.mark(Mark::Finally);
-                    self.expr_node(f);
-                    self.mark(Mark::PopFinally);
-                    self.close();
+                    self.tagged_expr("finally", f);
                 }
             }
             Expr::Asm(asm) => {
@@ -668,11 +677,11 @@ impl Expander<'_> {
             Stmt::Static { binder, ty, init } => {
                 self.opt_ty(ty);
                 self.opt_expr(init);
-                self.mark(Mark::BindDecl(binder));
+                self.mark(Mark::BindDecl(binder, BinderKind::Local));
             }
             Stmt::Global { binder, path } => {
                 self.path(path, Ns::Value);
-                self.mark(Mark::BindDecl(binder));
+                self.mark(Mark::BindDecl(binder, BinderKind::Local));
             }
             Stmt::Err => {}
         }
@@ -751,7 +760,7 @@ impl Expander<'_> {
         match *ty {
             Ty::Infer | Ty::Prim(_) | Ty::Any | Ty::Never | Ty::SelfTy | Ty::Err => {}
             Ty::Path(p) => self.path(p, Ns::Type),
-            Ty::Tuple(ts) => self.tys(ts),
+            Ty::Tuple(ts) | Ty::Union(ts) | Ty::Intersection(ts) => self.tys(ts),
             Ty::Object(bs) | Ty::Impl(bs) => self.bounds(bs),
             Ty::Array { elem, len } => {
                 self.ty_node(elem);
@@ -968,7 +977,7 @@ where
                         binders.extend(store.list(list).iter().map(|c| c.binder));
                         None
                     }
-                    Mark::BindDecl(b) | Mark::SelfBinder(b) | Mark::Label(b) => {
+                    Mark::BindDecl(b, _) | Mark::SelfBinder(b) | Mark::Label(b) => {
                         binders.push(b);
                         None
                     }
@@ -988,6 +997,61 @@ where
         if f(event) == Control::Stop {
             return;
         }
+    }
+}
+
+/// Calls `f` on each binder `node` binds directly (its own binding site, not
+/// its descendants'): a binding pattern, a closure's captures and self
+/// binder, a label, a `static`/`global`/`let_place` binder, generic
+/// parameters.
+pub(crate) fn direct_binders(store: &Store, node: NodeRef, mut f: impl FnMut(BinderId)) {
+    match node {
+        NodeRef::Pat(p) => {
+            if let Some(Pat::Bind { binder, .. } | Pat::Ident { binder, .. }) = store.pat(p) {
+                f(*binder);
+            }
+        }
+        NodeRef::Expr(e) => match store.expr(e) {
+            Some(Expr::Closure(c)) => {
+                for cap in store.list(c.captures) {
+                    f(cap.binder);
+                }
+                if let Some(me) = c.self_binder {
+                    f(me);
+                }
+            }
+            Some(Expr::Loop { label: Some(l), .. }) => f(*l),
+            Some(Expr::Block(b)) => {
+                if let Some(l) = b.label {
+                    f(l);
+                }
+            }
+            Some(Expr::LetPlace { binder, .. }) => f(*binder),
+            _ => {}
+        },
+        NodeRef::Stmt(s) => {
+            if let Some(Stmt::Static { binder, .. } | Stmt::Global { binder, .. }) = store.stmt(s) {
+                f(*binder);
+            }
+        }
+        NodeRef::Item(i) => {
+            let generics = match store.item(i).map(|i| &i.kind) {
+                Some(ItemKind::Fn(x)) => Some(x.generics),
+                Some(ItemKind::Record(x)) => Some(x.generics),
+                Some(ItemKind::Sum(x)) => Some(x.generics),
+                Some(ItemKind::Class(x)) => Some(x.generics),
+                Some(ItemKind::Interface(x)) => Some(x.generics),
+                Some(ItemKind::Impl(x)) => Some(x.generics),
+                Some(ItemKind::Alias { generics, .. }) => Some(*generics),
+                _ => None,
+            };
+            if let Some(g) = generics {
+                for gp in store.list(g.params) {
+                    f(gp.binder);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

@@ -82,6 +82,11 @@ impl Effects {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+
+    /// The raw bit set, for canonical keys.
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 impl fmt::Debug for Effects {
@@ -176,6 +181,15 @@ pub enum Ty {
     Object(List<Bound>),
     /// An opaque type known only by its bounds: `impl A + B`.
     Impl(List<Bound>),
+    /// A union `A | B | ...` (PHP, TypeScript, Python). At least two members,
+    /// none of them a union or a `Nullable` (write `Nullable(Union)`), in
+    /// canonical order without repeats; [`Builder::finish`](crate::Builder::finish)
+    /// normalizes them (spec §5.1).
+    Union(List<TyId>),
+    /// An intersection `A & B & ...`. At least two members, none of them an
+    /// intersection, in canonical order without repeats. Members may be
+    /// unions (TypeScript); PHP's disjunctive normal form is a language rule.
+    Intersection(List<TyId>),
     /// The type of expressions that never complete.
     Never,
     /// `Self` inside an interface, impl, or class.

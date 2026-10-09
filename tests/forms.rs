@@ -289,6 +289,7 @@ pub fn kitchen_sink() -> (Hir, intern_lang::Interner) {
 
     let main = main_fn(&mut k);
     let extras = new_forms(&mut k);
+    let generator = forms_0_4(&mut k);
 
     let root_name = k.name("app");
     let root = k.b.module(
@@ -309,6 +310,7 @@ pub fn kitchen_sink() -> (Hir, intern_lang::Interner) {
             extras.1,
             extras.2,
             extras.3,
+            generator,
         ],
     );
     let inline = k.ident("inline");
@@ -565,7 +567,10 @@ fn main_fn(k: &mut Kit) -> hir_lang::ItemId {
         pat: Some(pe),
     });
     let eu = k.b.use_binder(e_b);
-    let yl = k.b.expr(Expr::Yield(Some(eu)));
+    let yl = k.b.expr(Expr::Yield {
+        key: None,
+        value: Some(eu),
+    });
     let catches = k.b.list(&[Arm {
         pat: is_str,
         guard: None,
@@ -1157,6 +1162,119 @@ fn new_forms(
     (script, zero_fn, use_free_fn(k), unit_ref_fn(k))
 }
 
+/// The 0.4 forms. Types are built already flat (only their order is
+/// canonicalized by `finish`), so every node stays reachable.
+///
+/// ```text
+/// fn gen(a) yield {
+///     let _: S | i64 = ...; let _: A & B;
+///     let_place p = a[0] in p = mox.concat(p, "x");
+///     yield "k" => bit_not(1); yield from a;
+///     pow<promote>(2, 3); shl<saturate>(1, 70)
+/// }
+/// ```
+fn forms_0_4(k: &mut Kit) -> hir_lang::ItemId {
+    let a_name = k.name("a");
+    let (pa, a) = k.b.local_param(a_name);
+    // let _: S | i64;   (given out of order: `finish` sorts it)
+    let s_name = k.name("S");
+    let s_path = k.b.name_path(s_name, Ns::Type);
+    let s_ty = k.b.ty(Ty::Path(s_path));
+    let i64_ty = k.b.ty(Ty::Prim(Prim::I64));
+    let ul = k.b.list(&[s_ty, i64_ty]);
+    let union = k.b.ty(Ty::Union(ul));
+    let w1 = k.b.pat(Pat::Wild);
+    let let_u = k.b.stmt(Stmt::Let {
+        pat: w1,
+        ty: Some(union),
+        init: None,
+        else_: None,
+    });
+    // let _: A & B;
+    let an = k.name("A");
+    let ap = k.b.name_path(an, Ns::Type);
+    let at = k.b.ty(Ty::Path(ap));
+    let bn = k.name("B");
+    let bp = k.b.name_path(bn, Ns::Type);
+    let bt = k.b.ty(Ty::Path(bp));
+    let il = k.b.list(&[at, bt]);
+    let inter = k.b.ty(Ty::Intersection(il));
+    let w2 = k.b.pat(Pat::Wild);
+    let let_i = k.b.stmt(Stmt::Let {
+        pat: w2,
+        ty: Some(inter),
+        init: None,
+        else_: None,
+    });
+    // let_place p = a[0] in p = mox.concat(p, "x")
+    let use_a = k.b.use_binder(a);
+    let zero = k.b.int(0);
+    let place = k.b.expr(Expr::Index {
+        base: use_a,
+        index: zero,
+    });
+    let p = k.binder("p", BinderKind::Place);
+    let target = k.b.use_binder(p);
+    let read = k.b.use_binder(p);
+    let concat_name = k.name("concat");
+    let concat_sym = k.sym("mox.concat");
+    let concat =
+        k.b.resolved_path(concat_name, Ns::Value, Res::Extern(concat_sym));
+    let concat = k.b.expr(Expr::Path(concat));
+    let x = k.b.str_lit("x");
+    let value = k.b.call(concat, &[read, x]);
+    let assign = k.b.expr(Expr::Assign {
+        target,
+        op: None,
+        value,
+    });
+    let let_place = k.b.expr(Expr::LetPlace {
+        binder: p,
+        place,
+        body: assign,
+    });
+    let s_place = k.b.expr_stmt(let_place);
+    // yield "k" => bit_not(1); yield from a;
+    let key = k.b.str_lit("k");
+    let one = k.b.int(1);
+    let flipped = k.b.op(OpKind::BitNot, &[one]);
+    let y = k.b.expr(Expr::Yield {
+        key: Some(key),
+        value: Some(flipped),
+    });
+    let s_yield = k.b.expr_stmt(y);
+    let use_a2 = k.b.use_binder(a);
+    let yf = k.b.expr(Expr::YieldFrom(use_a2));
+    let s_yf = k.b.expr_stmt(yf);
+    // pow<promote>(2, 3); shl<saturate>(1, 70)
+    let two = k.b.int(2);
+    let three = k.b.int(3);
+    let pow = k.b.op_with(
+        Op::new(OpKind::Pow).with_overflow(Overflow::Promote),
+        &[two, three],
+    );
+    let s_pow = k.b.expr_stmt(pow);
+    let one2 = k.b.int(1);
+    let seventy = k.b.int(70);
+    let shl = k.b.op_with(
+        Op::new(OpKind::Shl).with_shift(hir_lang::Shift::Saturate),
+        &[one2, seventy],
+    );
+    let body =
+        k.b.block(&[let_u, let_i, s_place, s_yield, s_yf, s_pow], Some(shl));
+    let gen_name = k.name("gen");
+    let params = k.b.list(&[pa]);
+    k.b.item(Item::new(
+        Some(gen_name),
+        ItemKind::Fn(FnDef {
+            params,
+            effects: Effects::YIELD,
+            body: Some(body),
+            ..FnDef::default()
+        }),
+    ))
+}
+
 /// A function whose call target resolves partially: `Vec::new()`.
 fn use_free_fn(k: &mut Kit) -> hir_lang::ItemId {
     let vec_name = k.name("Vec");
@@ -1733,5 +1851,46 @@ const SNAPSHOT: &str = r##"(module app
   (fn cross
     (block
       (call
-        (use (path helper → item u7:3))))))
+        (use (path helper → item u7:3)))))
+  (fn gen yield
+    (param normal
+      (bind a%33))
+    (block
+      (let
+        (wild)
+        (union
+          (prim i64)
+          (type (path S))))
+      (let
+        (wild)
+        (intersection
+          (type (path A))
+          (type (path B))))
+      (do
+        (let-place p%34
+          (index
+            (use (path a → local a%33))
+            (lit 0))
+          (assign
+            (use (path p → local p%34))
+            (call
+              (use (path concat → extern mox.concat))
+              (use (path p → local p%34))
+              (lit "x")))))
+      (do
+        (yield
+          (key
+            (lit "k"))
+          (op bit_not
+            (lit 1))))
+      (do
+        (yield-from
+          (use (path a → local a%33))))
+      (do
+        (op pow overflow=promote
+          (lit 2)
+          (lit 3)))
+      (op shl shift=saturate
+        (lit 1)
+        (lit 70)))))
 "##;

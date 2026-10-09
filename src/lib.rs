@@ -76,6 +76,7 @@
 extern crate alloc;
 
 mod builder;
+mod canon;
 mod copy;
 mod def;
 mod error;

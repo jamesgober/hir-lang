@@ -121,6 +121,37 @@ Delivered: the forms and APIs listed above; tests `tests/features.rs` (20) and
 `tests/spec_examples.rs` (5), two lenient-mode property tests; every earlier test updated to
 0.3 semantics.
 
+## v0.4.0 - LSF2 / Mox gaps (DONE, breaking)
+Writing the LSF2 spec and the Mox sketch found HIR gaps (ISSUES P12, P13, P20-P23); fixed as a
+breaking 0.x minor (0.3.0 was published). Spec `specs/HIR.md` revised to v3.
+
+| ID | Finding | Status |
+|---|---|---|
+| P20 | No union/intersection types | **Fixed.** `Ty::Union`, `Ty::Intersection`; canonical form (spec §5.1): arity >= 2, no same-kind nesting (and no `Nullable` in a union), strict order by a resolution-independent key, so no repeats. `finish` normalizes (flatten, hoist `Nullable`, sort, dedup, collapse); the validator checks. Members with error forms, constant expressions, or more than 64 nodes are unkeyed and exempt from ordering (keeps the check linear at any nesting). |
+| P21 | Compound assignment cannot evaluate its place once; value of assignment unstated | **Fixed with the place-once binding form**, `Expr::LetPlace { binder, place, body }` (binder kind `Place`, crosses no frame), rather than a `CompoundAssign` with a non-OPS operator: `??=` and `++`/`--` are templates (control flow), not operators, so only a binding form covers all of them, and it composes with templates. `Assign` evaluates to the value written. Spec §8.2 gives bcgen-lang's lowering (operand registers once; load/store sequences per use). `pow` added to the OPS compound operators. |
+| P22 | No keyed yield / `yield from`; no no-match error; `not` ambiguous | **Fixed.** `Yield { key, value }` (a key needs a value), `YieldFrom` (keys, sends and throws forwarded; value = inner return value), mapped onto LSB `yield_kv` and a delegation loop. `match` without a matching arm raises `NoMatch` (E0200; HIR owns E0200-E0299). `OpKind::Not` is logical (`dlnot`), `OpKind::BitNot` bitwise (`dnot`). |
+| P23 | OPS v2: `pow`, `shift = saturate` | **Fixed.** `OpKind::Pow` (consults `overflow`; `promote` rules per OPS v2), `Shift::Saturate`. |
+| P12 | Lenient repair: 16-round cap with an empty-the-module fallback; later-round problems swallowed | **Fixed.** Each round removes the consequences of its own repairs (cut-off nodes, references to binders whose site vanished or kind changed), so the rescan and rewalk are clean: at most two rounds (argument in spec §13.2 and `validate/repair.rs`). Every pass reports everything it finds (all repeats of a binding, all or-pattern alternative problems, each orphaned subtree once); a second binding site never changes the binder's kind. Fallback removed; a debug assertion checks the bound under the property tests (one-off: 50,000 arenas, 20,000 programs, no third round); a hard limit turns a broken argument into an error, not a hang. |
+| P13 | `lookup_local` only in the path's namespace | **Fixed.** `Hir::lookup_local_in(path, name, ns)` (additive). |
+| (LSB) | HIR v2 forbade `yield` in `finally`/`defer`; LSB rule 12 defines it | **Aligned**: `YieldInCleanup` removed; yielding while being closed is the run-time `CloseIgnored`. |
+
+Delivered:
+- The forms and APIs above; spec v3 (also the §20 template additions LSF2 §15.8 requires:
+  holes, template binders, free names, ops without policy, `apply:`; and §9.6, a Mox example
+  of `.=` through `let_place` with a union parameter type).
+- Tests: `tests/features_0_4.rs` (20), canonical-form unit tests (6), a sixth spec example, the
+  0.4 forms in the every-form snapshot and in the garbage generator; benchmarks for 100,000
+  unions and a 100,000-deep union nest.
+
+Dependency wiring: unchanged (span-lang 0.4, intern-lang 1; no new dependency).
+
+Recorded, not done here (per the anti-deferral rule):
+- **`NoMatch` as an LSB error kind**: `bytecode_lang::ErrorKind` must gain `NoMatch` (E0200)
+  before bcgen-lang can emit it as a built-in kind (spec §8.10); that is bytecode-lang's change.
+  Until then bcgen-lang raises it through the language's error constructor.
+- **The decoder's re-sort of union members** (symbol ids change on re-interning) is part of the
+  0.5 encoding (spec §21).
+
 ## v0.5.0 - Implementation
 - [ ] Textual form (printer + parser) with round-trip property tests.
 - [ ] Body-graph view: control flow over places for flow-sensitive capabilities (ownership checking, D12), per spec §19 (NLL inputs, unwind edges for every fallible op; review findings M2/H4).

@@ -857,6 +857,61 @@ impl Hir {
         lookup_local(&self.index, name, ns, pos)
     }
 
+    /// Like [`lookup_local`](Self::lookup_local), but in the namespace `ns`
+    /// instead of the path's own: the innermost binder named `name` of a kind
+    /// that lives in `ns` and is in scope at `path`.
+    ///
+    /// A resolver needs this for a path whose prefix lives in another
+    /// namespace than the whole path, such as the type parameter `T` in the
+    /// value path `T::new`. `Ns::Pattern` searches value binders (patterns
+    /// never bind into a namespace of their own); `Ns::Import` finds nothing
+    /// (no binder is imported). Frames are not filtered, as for
+    /// `lookup_local`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hir_lang::{BinderKind, Builder, Expr, FnDef, GenericParam, Generics, Item, ItemKind, Name, Ns};
+    /// use intern_lang::Interner;
+    ///
+    /// // fn make<T>() { T::new }  — `T` is a type parameter seen from a value path.
+    /// let mut names = Interner::new();
+    /// let t = Name::new(names.intern("T"));
+    /// let mut b = Builder::new();
+    /// let tp = b.new_binder(t, BinderKind::TypeParam);
+    /// let params = b.list(&[GenericParam::new(tp)]);
+    /// let segs = [
+    ///     hir_lang::Segment::new(t, b.origin()),
+    ///     hir_lang::Segment::new(Name::new(names.intern("new")), b.origin()),
+    /// ];
+    /// let segments = b.list(&segs);
+    /// let path = b.path(hir_lang::Path::new(segments, Ns::Value));
+    /// let use_new = b.expr(Expr::Path(path));
+    /// let body = b.block(&[], Some(use_new));
+    /// let make = b.item(Item::new(
+    ///     Some(Name::new(names.intern("make"))),
+    ///     ItemKind::Fn(FnDef { generics: Generics { params, ..Generics::default() }, body: Some(body), ..FnDef::default() }),
+    /// ));
+    /// let root = b.module(None, &[make]);
+    /// let hir = b.finish(root)?;
+    /// assert_eq!(hir.lookup_local(path, t), None);            // no value named `T`
+    /// assert_eq!(hir.lookup_local_in(path, t, Ns::Type), Some(tp));
+    /// # Ok::<(), hir_lang::HirError>(())
+    /// ```
+    #[must_use]
+    pub fn lookup_local_in(&self, path: PathId, name: Name, ns: Ns) -> Option<BinderId> {
+        let ns = match ns {
+            Ns::Pattern => Ns::Value,
+            Ns::Import => return None,
+            other => other,
+        };
+        let pos = *self.index.path_pos.get(path.index())?;
+        if pos == u32::MAX {
+            return None;
+        }
+        lookup_local(&self.index, name, ns, pos)
+    }
+
     /// Returns the variables a closure captures implicitly: value binders
     /// defined outside the closure that its body (or its parameters' defaults)
     /// refer to through resolved paths, in order of first use. Explicit

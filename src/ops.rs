@@ -58,6 +58,7 @@ pub enum DivZero {
 /// use hir_lang::Shift;
 ///
 /// assert_ne!(Shift::Error, Shift::Mask);
+/// assert_ne!(Shift::Mask, Shift::Saturate);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shift {
@@ -65,6 +66,10 @@ pub enum Shift {
     Error,
     /// Use the amount modulo the bit width.
     Mask,
+    /// PHP semantics (OPS v2): an amount at or above the width gives `0`
+    /// (`shr` of a negative signed value gives `-1`); a negative amount is
+    /// still `ShiftOutOfRange`.
+    Saturate,
 }
 
 /// What happens when a float-to-int conversion meets NaN or an out-of-range value.
@@ -249,12 +254,21 @@ pub enum OpKind {
     Or,
     /// `xor` (2).
     Xor,
-    /// `not`: bitwise or logical complement (1).
+    /// `not`: logical negation (1). On dynamic values, negation of the
+    /// value's truthiness (LSB `dlnot`); the bitwise complement is
+    /// [`OpKind::BitNot`].
     Not,
+    /// `bit_not`: bitwise complement of an integer (1; LSB `dnot` on dynamic
+    /// values).
+    BitNot,
     /// `shl` (2).
     Shl,
     /// `shr`: arithmetic for signed, logical for unsigned (2).
     Shr,
+    /// `pow`: exponentiation (2; OPS v2). Integer `pow` consults `overflow`
+    /// (and raises `NegativeExponent` for a negative exponent unless the
+    /// policy is `promote`); float `pow` ignores the policy.
+    Pow,
     /// `eq` (2).
     Eq,
     /// `ne` (2).
@@ -342,8 +356,10 @@ impl OpKind {
             Self::Or => "or",
             Self::Xor => "xor",
             Self::Not => "not",
+            Self::BitNot => "bit_not",
             Self::Shl => "shl",
             Self::Shr => "shr",
+            Self::Pow => "pow",
             Self::Eq => "eq",
             Self::Ne => "ne",
             Self::Lt => "lt",
@@ -416,6 +432,7 @@ impl OpKind {
             Self::Neg
             | Self::Abs
             | Self::Not
+            | Self::BitNot
             | Self::Sqrt
             | Self::Floor
             | Self::Ceil
@@ -453,9 +470,13 @@ impl OpKind {
     #[must_use]
     pub const fn default_policy(self) -> Policy {
         match self {
-            Self::Add | Self::Sub | Self::Mul | Self::Neg | Self::Abs | Self::IntCast(_) => {
-                Policy::NONE.with_overflow(Overflow::Error)
-            }
+            Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::Neg
+            | Self::Abs
+            | Self::Pow
+            | Self::IntCast(_) => Policy::NONE.with_overflow(Overflow::Error),
             Self::Div | Self::FloorDiv => Policy::NONE
                 .with_overflow(Overflow::Error)
                 .with_div_zero(DivZero::Error),

@@ -1028,6 +1028,8 @@ impl Builder {
         if let Some(what) = self.overflow {
             return Err(HirError::CapacityExceeded { what });
         }
+        crate::canon::normalize(&mut self.store)
+            .map_err(|what| HirError::CapacityExceeded { what })?;
         self.normalize_attrs();
         let ctx = Ctx {
             unit: self.unit,
@@ -1083,6 +1085,48 @@ impl Builder {
         if let Some(what) = self.overflow {
             return Err(HirError::CapacityExceeded { what });
         }
+        crate::canon::normalize(&mut self.store)
+            .map_err(|what| HirError::CapacityExceeded { what })?;
+        self.normalize_attrs();
+        let ctx = Ctx {
+            unit: self.unit,
+            tag: self.tag,
+        };
+        let (index, problems) = validate_lenient(&mut self.store, root, ctx)?;
+        Ok((
+            Hir::from_parts(self.store, root, self.unit, self.tag, index),
+            problems,
+        ))
+    }
+
+    /// The store, for crate unit tests.
+    #[cfg(test)]
+    pub(crate) fn store_for_tests(&self) -> &Store {
+        &self.store
+    }
+
+    /// `finish` without the union/intersection normalization, so tests can
+    /// hand the validator types that are not in canonical form (as a decoder
+    /// could).
+    #[cfg(test)]
+    pub(crate) fn finish_unnormalized(mut self, root: ItemId) -> Result<Hir, HirError> {
+        self.normalize_attrs();
+        let ctx = Ctx {
+            unit: self.unit,
+            tag: self.tag,
+        };
+        let index = validate(&self.store, root, ctx)?;
+        Ok(Hir::from_parts(
+            self.store, root, self.unit, self.tag, index,
+        ))
+    }
+
+    /// `finish_lenient` without the normalization, for tests.
+    #[cfg(test)]
+    pub(crate) fn finish_lenient_unnormalized(
+        mut self,
+        root: ItemId,
+    ) -> Result<(Hir, Vec<HirError>), HirError> {
         self.normalize_attrs();
         let ctx = Ctx {
             unit: self.unit,

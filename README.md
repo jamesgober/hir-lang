@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, two dependencies from the family: <a href="https://crates.io/crates/span-lang"><code>span-lang</code></a> 0.4 and <a href="https://crates.io/crates/intern-lang"><code>intern-lang</code></a> 1.
     </p>
     <blockquote>
-        <strong>Status: 0.3.0.</strong> A breaking revision of 0.2.0 that closes the gaps an adversarial review found (units, partial resolution, lenient validation, PHP/Mox and low-level forms, resolver support). The data model, builder, strict and lenient validator, traversal, and debug printer are implemented. The body-graph view for flow-sensitive analysis, the round-trippable textual syntax, and the binary encoding are specified and land in 0.5; they are not in this release. The API is frozen at 1.0 only after lower-lang, resolve-lang, and typeck-lang have used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and the <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
+        <strong>Status: 0.4.0.</strong> A breaking revision of 0.3.0 for the gaps the LSF2 spec and the Mox sketch found: union and intersection types, place-once compound assignment and the value of assignments, keyed yields and <code>yield from</code>, logical versus bitwise <code>not</code>, <code>pow</code> and PHP shifts (OPS v2), lenient repair in at most two rounds, and <code>lookup_local_in</code>. The data model, builder, strict and lenient validator, traversal, and debug printer are implemented. The body-graph view for flow-sensitive analysis, the round-trippable textual syntax, and the binary encoding are specified and land in 0.5; they are not in this release. The API is frozen at 1.0 only after lower-lang, resolve-lang, and typeck-lang have used it end to end. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and the <a href="./dev/ROADMAP.md"><code>ROADMAP</code></a>.
     </blockquote>
 </div>
 
@@ -39,7 +39,7 @@
 ## The model
 
 - A **[`Builder`](./docs/API.md#builder)** creates nodes bottom-up &mdash; items, expressions, statements, patterns, types, paths, fields, variants, parameters &mdash; for one compilation unit, and stamps each with its current **origin** (span plus expansion). [`finish`](./docs/API.md#builderfinish--builderfinish_lenient) validates strictly; `finish_lenient` repairs every problem to an error node and reports them all in source order. [`copy_subtree`](./docs/API.md#buildercopy_subtree) duplicates a subtree with fresh binders.
-- A **[`Hir`](./docs/API.md#hir)** is the validated result: dense arenas of `Copy` nodes linked by 4-byte typed ids, with accessors, O(1)-checked [`resolve` / `resolve_partial`](./docs/API.md#hirresolve--hirresolve_partial) for name resolution in place (including other units' definitions), [`lookup_local`](./docs/API.md#hirlookup_local) for the scope rule, [`implicit_captures`](./docs/API.md#hirimplicit_captures--hirall_implicit_captures) for closure conversion, and an iterative [walker](./docs/API.md#hirwalk_from--hirchildren_into) that also reports scopes, binders, and frames.
+- A **[`Hir`](./docs/API.md#hir)** is the validated result: dense arenas of `Copy` nodes linked by 4-byte typed ids, with accessors, O(1)-checked [`resolve` / `resolve_partial`](./docs/API.md#hirresolve--hirresolve_partial) for name resolution in place (including other units' definitions), [`lookup_local` / `lookup_local_in`](./docs/API.md#hirlookup_local--hirlookup_local_in) for the scope rule, [`implicit_captures`](./docs/API.md#hirimplicit_captures--hirall_implicit_captures) for closure conversion, and an iterative [walker](./docs/API.md#hirwalk_from--hirchildren_into) that also reports scopes, binders, and frames.
 - **[`walk`](./docs/API.md#walk)** and **[`print`](./docs/API.md#print)** are the one-call entry points: visit every node, or render the deterministic debug form.
 - A **[`HirError`](./docs/API.md#hirerror)** names exactly what is wrong and where: a dangling id, a shared node, a binder used out of scope, a `break` without a loop, an `await` outside an async function, an op without its policy.
 
@@ -53,7 +53,8 @@ What it guarantees, and how each guarantee is checked:
 | Scoping, frames, captures, and jumps follow the spec, including which error is reported first. | A reference implementation (a recursive environment walk) runs alongside every generated program; the validator's single-pass interval algorithm must agree on the result and on the exact first error. 1,024 programs per run, 20,000 in a one-off run, no disagreement. |
 | Builder output with in-scope references always validates; each class of corruption is rejected with its own error. | Random programs whose references are drawn from the reference's legal set always validate; targeted corruptions (shared node, orphan, dangling id, missing policy, wrong arity, wrong binder kind, stray `break`, use before `let`) each produce their error, and an unbound binder (valid since 0.3) is accepted. |
 | `resolve` keeps a `Hir` valid. | Random sequences of resolutions: accepted ones take effect, rejected ones change nothing, and the result re-validates. |
-| Lenient validation always yields a valid `Hir`, and agrees with strict validation. | On 2,048 arbitrary arenas per run, `finish_lenient` either fails for a reason with no repair (missing or non-module root) or returns a `Hir` that re-validates, deterministically; on 1,024 generated programs per run it reports no problems exactly when strict `finish` succeeds, and strict's error is always among its problems. |
+| Lenient validation always yields a valid `Hir` in at most two repair rounds, and agrees with strict validation. | On 2,048 arbitrary arenas per run (including unions, place aliases, keyed yields), `finish_lenient` either fails for a reason with no repair (missing or non-module root) or returns a `Hir` that re-validates, deterministically, and a debug assertion checks the two-round bound (a one-off run of 50,000 arenas and 20,000 programs found no third round); on 1,024 generated programs per run it reports no problems exactly when strict `finish` succeeds, and strict's error is always among its problems. |
+| Unions and intersections have one canonical form. | `finish` flattens, sorts, deduplicates, and collapses them; unit tests feed the validator non-canonical ones (wrong order, repeats, nesting, one member) and check each is rejected, and that resolving a member never breaks the order. |
 | The spec's examples are real. | Each lowering example in `specs/HIR.md` §9 is built, validated, and printed by a test that checks the printed form appears verbatim in the spec. |
 | Every node carries an origin; construction is deterministic. | Property tests check every node's and binder's origin, and that equal input gives equal `Hir`s and byte-identical printed and debug forms; a golden snapshot covers every node form. |
 | Arbitrarily deep HIR builds, validates, walks, prints, clones, compares, and drops without recursion. | Tests on ~1M-node chains (nested ops, blocks, loops, closures, patterns, types, a 250,000-binder `let` chain) on the default 2 MiB test stack. |
@@ -65,7 +66,7 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-hir-lang = "0.3"
+hir-lang = "0.4"
 intern-lang = "1"
 ```
 
@@ -73,7 +74,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-hir-lang = { version = "0.3", default-features = false }
+hir-lang = { version = "0.4", default-features = false }
 ```
 
 <hr>
@@ -188,16 +189,18 @@ Measured with the benchmarks in [`benches/`](./benches) (library only), Windows 
 
 | Benchmark | What it measures | Windows |
 |---|---|---:|
-| `1m/build` | Build a module of 7,500 functions (825,001 nodes) | ~32 ms |
-| `1m/validate` | `finish` on that module | ~27 ms (31 M nodes/s) |
-| `1m/walk` | Visit every node (`walk`) | ~6.7 ms (123 M nodes/s) |
+| `1m/build` | Build a module of 7,500 functions (825,001 nodes) | ~34 ms |
+| `1m/validate` | `finish` on that module | ~25 ms (33 M nodes/s) |
+| `1m/walk` | Visit every node (`walk`) | ~7.1 ms (116 M nodes/s) |
 | `1m/print` | Render the debug form | ~51 ms |
-| `1m/clone_eq_drop` | Clone, compare, and drop the whole `Hir` | ~15 ms |
-| `1m/resolve_every_path` | `resolve` all 180,000 paths, each scope-checked | ~1.4 ms (~8 ns each) |
-| `deep_1m_chain/validate` | `finish` on a 1,000,000-deep expression chain | ~44 ms |
-| `deep_1m_chain/walk` | Walk it with `walk_from` (all events) | ~26 ms |
+| `1m/clone_eq_drop` | Clone, compare, and drop the whole `Hir` | ~13 ms |
+| `1m/resolve_every_path` | `resolve` all 180,000 paths, each scope-checked | ~1.3 ms (~7 ns each) |
+| `deep_1m_chain/validate` | `finish` on a 1,000,000-deep expression chain | ~43 ms |
+| `deep_1m_chain/walk` | Walk it with `walk_from` (all events) | ~27 ms |
+| `unions/finish_100k_flat` | `finish` (normalize + validate) on 100,000 four-member unions built out of order | ~76 ms |
+| `unions/finish_100k_nested` | `finish` on a 100,000-deep union nest (key budget at work) | ~109 ms |
 
-The 82,501-node workload scales proportionally (validate ~2.1 ms, walk ~0.6 ms). Against 0.2.0: `walk` is ~30% faster (a node-only path); `walk_from`, which now also reports scopes, binders, and frames, costs about twice 0.2's enter/leave walk; `clone_eq_drop` is ~20% and `resolve` ~25% slower (larger paths, more checks); deep-chain validation ~25% slower.
+The 82,501-node workload scales proportionally (validate ~2.3 ms, walk ~0.7 ms). Code without unions pays nothing for type normalization (a quick scan skips it), so 0.4 matches 0.3 there. Unions cost more per node than plain validation (~0.7 µs per union with its members, normalized and checked); the nested case is bounded by the 64-node key budget, which keeps it linear.
 
 ```bash
 cargo bench --bench bench
@@ -211,7 +214,9 @@ cargo bench --bench bench
 - **One loop.** `while`, C `for`, `do-while`, and `for-each` lower to one `Loop` with an optional `step` that runs after each iteration and on `continue`; that makes the C-style desugarings exact without rewriting the body. `for-each` goes through each language's iteration protocol in its lowering template. Every analysis handles one loop form instead of four.
 - **Resolution in place, checked, partial.** Lowering runs before resolution, so paths carry a resolution slot covering a prefix of their segments (the rest are resolved by type, as in rustc). Template temporaries are resolved by the lowering itself (hygiene by construction); resolve-lang fills the rest with `resolve`/`resolve_partial`, whose O(1) check uses the scope intervals the validator computed, and finds candidates with `lookup_local` and the walk's scope events instead of re-deriving the rules.
 - **Units, and ids that cannot be mixed up.** Definitions are named by `DefId { unit, def }`, so references cross units; ids minted by one `Hir` are tagged and rejected by another `Hir` of the same unit.
-- **Broken input is normal input.** `finish_lenient` turns each offending node into its error form and reports every problem once, in source order; cascades from a repair are suppressed.
+- **Broken input is normal input.** `finish_lenient` turns each offending node into its error form and reports every problem once, in source order. Each round removes the consequences of its own repairs, so two rounds always suffice (spec §13.2), with no "give up and empty the module" fallback.
+- **Places evaluated once.** A compound assignment with a host operator (`$a[f()] .= "x"`), `??=`, and `++`/`--` bind the place with `let_place`, whose operands are evaluated once; the alias never crosses a frame, so no tier needs a run-time reference for it.
+- **Canonical union types.** `int|string` and `string|int` are the same HIR: `finish` sorts members by a key that ignores resolutions, so resolving a name never reorders anything.
 - **Explicit captures, derived implicit ones.** Syntax that names captures (PHP `use`, C++ capture lists) records them with fresh inner binders; closures that capture implicitly declare a default mode, and the capture set is derived by `implicit_captures` rather than stored, so it can never go stale.
 - **Ops carry exactly their policy.** An `add` without an overflow policy, or a comparison with one, is rejected, so no execution tier ever guesses.
 - **Exhaustive node enums.** Node forms are not `#[non_exhaustive]`: every consumer must handle every form, and a new form is a breaking change for all of them anyway.
@@ -231,7 +236,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --bench bench
 ```
 
-[`tests/errors.rs`](./tests/errors.rs) produces every error variant from the smallest HIR that has it; [`tests/resolve.rs`](./tests/resolve.rs) covers scoping, frames, captures, hygiene, and `resolve`; [`tests/features.rs`](./tests/features.rs) covers the 0.3 forms and APIs (units, partial resolution, lenient mode, `lookup_local`, walk events, subtree copy); [`tests/spec_examples.rs`](./tests/spec_examples.rs) checks the spec's §9 examples verbatim; [`tests/forms.rs`](./tests/forms.rs) builds one HIR using every node form against a golden snapshot; [`tests/deep.rs`](./tests/deep.rs) runs the million-node depth tests; [`tests/properties.rs`](./tests/properties.rs) holds the property tests and the reference implementation. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+[`tests/errors.rs`](./tests/errors.rs) produces every error variant from the smallest HIR that has it; [`tests/resolve.rs`](./tests/resolve.rs) covers scoping, frames, captures, hygiene, and `resolve`; [`tests/features.rs`](./tests/features.rs) covers the 0.3 forms and APIs (units, partial resolution, lenient mode, `lookup_local`, walk events, subtree copy); [`tests/features_0_4.rs`](./tests/features_0_4.rs) the 0.4 ones (unions, `let_place`, keyed yields, `bit_not`, `pow`, two-round repair, `lookup_local_in`); [`tests/spec_examples.rs`](./tests/spec_examples.rs) checks the spec's §9 examples verbatim; [`tests/forms.rs`](./tests/forms.rs) builds one HIR using every node form against a golden snapshot; [`tests/deep.rs`](./tests/deep.rs) runs the million-node depth tests; [`tests/properties.rs`](./tests/properties.rs) holds the property tests and the reference implementation. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>

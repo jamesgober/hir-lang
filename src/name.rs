@@ -40,10 +40,15 @@ pub enum BinderKind {
     Region,
     /// A loop or block label.
     Label,
+    /// A place alias bound by [`Expr::LetPlace`](crate::Expr::LetPlace): it
+    /// names a place whose operands were evaluated once. Never visible across
+    /// a frame.
+    Place,
 }
 
 impl BinderKind {
-    /// Returns `true` for run-time variables: `Local`, `Param`, `Capture`.
+    /// Returns `true` for run-time variables: `Local`, `Param`, `Capture`,
+    /// `Place`.
     ///
     /// # Examples
     ///
@@ -55,7 +60,10 @@ impl BinderKind {
     /// ```
     #[must_use]
     pub const fn is_value(self) -> bool {
-        matches!(self, Self::Local | Self::Param | Self::Capture)
+        matches!(
+            self,
+            Self::Local | Self::Param | Self::Capture | Self::Place
+        )
     }
 
     /// Returns `true` for compile-time binders: `TypeParam`, `ConstParam`,
@@ -88,7 +96,9 @@ impl BinderKind {
     #[must_use]
     pub const fn ns(self) -> Option<Ns> {
         match self {
-            Self::Local | Self::Param | Self::Capture | Self::ConstParam => Some(Ns::Value),
+            Self::Local | Self::Param | Self::Capture | Self::Place | Self::ConstParam => {
+                Some(Ns::Value)
+            }
             Self::TypeParam => Some(Ns::Type),
             Self::Region => Some(Ns::Region),
             Self::Label => None,
@@ -114,6 +124,7 @@ impl BinderKind {
             Self::ConstParam => "const-param",
             Self::Region => "region",
             Self::Label => "label",
+            Self::Place => "place",
         }
     }
 }

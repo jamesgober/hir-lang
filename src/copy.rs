@@ -63,7 +63,9 @@ pub(crate) fn copy_subtree(
     };
     // Fresh binders for everything bound inside.
     for &n in &order {
-        for b in bound_by(store, n) {
+        let mut bound = Vec::new();
+        crate::walk::direct_binders(store, n, |b| bound.push(b));
+        for b in bound {
             if m.binders.contains_key(&b) {
                 continue;
             }
@@ -87,52 +89,6 @@ pub(crate) fn copy_subtree(
         }
     }
     m.nodes.get(&root).copied()
-}
-
-/// The binders a node binds directly.
-fn bound_by(store: &Store, n: NodeRef) -> Vec<BinderId> {
-    let mut out = Vec::new();
-    match n {
-        NodeRef::Pat(p) => {
-            if let Some(Pat::Bind { binder, .. } | Pat::Ident { binder, .. }) = store.pat(p) {
-                out.push(*binder);
-            }
-        }
-        NodeRef::Expr(e) => match store.expr(e) {
-            Some(Expr::Closure(c)) => {
-                out.extend(store.list(c.captures).iter().map(|c| c.binder));
-                out.extend(c.self_binder);
-            }
-            Some(Expr::Loop { label, .. }) => out.extend(*label),
-            Some(Expr::Block(b)) => out.extend(b.label),
-            _ => {}
-        },
-        NodeRef::Stmt(s) => {
-            if let Some(Stmt::Static { binder, .. } | Stmt::Global { binder, .. }) = store.stmt(s) {
-                out.push(*binder);
-            }
-        }
-        NodeRef::Item(i) => {
-            if let Some(g) = store.item(i).and_then(|i| generics_of(&i.kind)) {
-                out.extend(store.list(g.params).iter().map(|g| g.binder));
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
-fn generics_of(kind: &ItemKind) -> Option<Generics> {
-    match kind {
-        ItemKind::Fn(f) => Some(f.generics),
-        ItemKind::Record(r) => Some(r.generics),
-        ItemKind::Sum(s) => Some(s.generics),
-        ItemKind::Class(c) => Some(c.generics),
-        ItemKind::Interface(i) => Some(i.generics),
-        ItemKind::Impl(i) => Some(i.generics),
-        ItemKind::Alias { generics, .. } => Some(*generics),
-        _ => None,
-    }
 }
 
 fn push<T>(arena: &mut Arena<T>, node: T, origin: Origin) -> Option<u32> {
@@ -456,6 +412,8 @@ impl Mapper {
         Some(match ty {
             Ty::Path(p) => Ty::Path(self.pa(p)),
             Ty::Tuple(ts) => Ty::Tuple(self.tys(store, ts)?),
+            Ty::Union(ts) => Ty::Union(self.tys(store, ts)?),
+            Ty::Intersection(ts) => Ty::Intersection(self.tys(store, ts)?),
             Ty::Array { elem, len } => Ty::Array {
                 elem: self.t(elem),
                 len: self.e(len),
@@ -722,7 +680,20 @@ impl Mapper {
                 finally: finally.map(|e| self.e(e)),
             },
             Expr::Await(x) => Expr::Await(self.e(x)),
-            Expr::Yield(v) => Expr::Yield(v.map(|e| self.e(e))),
+            Expr::Yield { key, value } => Expr::Yield {
+                key: key.map(|e| self.e(e)),
+                value: value.map(|e| self.e(e)),
+            },
+            Expr::YieldFrom(x) => Expr::YieldFrom(self.e(x)),
+            Expr::LetPlace {
+                binder,
+                place,
+                body,
+            } => Expr::LetPlace {
+                binder: self.b(binder),
+                place: self.e(place),
+                body: self.e(body),
+            },
             Expr::Spawn(x) => Expr::Spawn(self.e(x)),
             Expr::Asm(a) => Expr::Asm(Asm {
                 operands: self.list(store, a.operands, |m, op| AsmOperand {

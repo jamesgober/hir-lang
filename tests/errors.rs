@@ -718,21 +718,46 @@ fn test_effect_problems_each_reported() {
         })
     );
 
-    // yield inside a finally (cleanup can run while the generator is closed)
+    // yield inside a finally is an ordinary suspension (LSB rule 12); only a
+    // generator being closed may not yield there, which is a runtime error.
     let mut k = Kit::new();
     let one = int(&mut k, 1);
-    let y = k.b.expr(Expr::Yield(Some(one)));
+    let y = k.b.expr(Expr::Yield {
+        key: None,
+        value: Some(one),
+    });
     let body = int(&mut k, 0);
     let t = k.b.expr(Expr::Try {
         body,
         catches: List::EMPTY,
         finally: Some(y),
     });
+    assert!(k.finish_body_fx(t, Effects::YIELD).is_ok());
+
+    // a keyed yield needs a value
+    let mut k = Kit::new();
+    let key = int(&mut k, 1);
+    let y = k.b.expr(Expr::Yield {
+        key: Some(key),
+        value: None,
+    });
     assert_eq!(
-        k.finish_body_fx(t, Effects::YIELD),
+        k.finish_body_fx(y, Effects::YIELD),
+        Err(HirError::Malformed {
+            site: Site::Node(NodeRef::Expr(y)),
+            problem: Malformed::YieldKey
+        })
+    );
+
+    // yield from outside a generator
+    let mut k = Kit::new();
+    let inner = int(&mut k, 1);
+    let y = k.b.expr(Expr::YieldFrom(inner));
+    assert_eq!(
+        k.finish_body(y),
         Err(HirError::Effect {
             expr: y,
-            problem: EffectProblem::YieldInCleanup
+            problem: EffectProblem::YieldOutsideGenerator
         })
     );
 
@@ -745,7 +770,10 @@ fn test_effect_problems_each_reported() {
         let x = int(&mut k, 1);
         let e = match form {
             "await" => k.b.expr(Expr::Await(x)),
-            "yield" => k.b.expr(Expr::Yield(Some(x))),
+            "yield" => k.b.expr(Expr::Yield {
+                key: None,
+                value: Some(x),
+            }),
             _ => k.b.expr(Expr::Throw(x)),
         };
         assert_eq!(k.finish_body(e), Err(HirError::Effect { expr: e, problem }));
@@ -758,7 +786,10 @@ fn test_effects_allowed_in_matching_frames() {
     let x = int(&mut k, 1);
     let a = k.b.expr(Expr::Await(x));
     let y = int(&mut k, 2);
-    let yl = k.b.expr(Expr::Yield(Some(y)));
+    let yl = k.b.expr(Expr::Yield {
+        key: None,
+        value: Some(y),
+    });
     let z = int(&mut k, 3);
     let th = k.b.expr(Expr::Throw(z));
     let s1 = k.b.expr_stmt(a);

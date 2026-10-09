@@ -721,6 +721,21 @@ impl<'a> Scan<'a> {
                     Err(malformed(site, Malformed::AssignTarget))
                 }
             }
+            Expr::LetPlace {
+                binder,
+                place,
+                body,
+            } => {
+                self.b(binder, site)?;
+                self.e(place, site)?;
+                self.e(body, site)?;
+                let place = self.s.expr(place);
+                if is_place(place) && !matches!(place, Some(Expr::Append(_))) {
+                    Ok(())
+                } else {
+                    Err(malformed(site, Malformed::AssignTarget))
+                }
+            }
             Expr::RefAssign { target, source } => {
                 self.e(target, site)?;
                 self.e(source, site)?;
@@ -736,6 +751,7 @@ impl<'a> Scan<'a> {
             | Expr::Throw(x)
             | Expr::Await(x)
             | Expr::Spawn(x)
+            | Expr::YieldFrom(x)
             | Expr::VarVar(x)
             | Expr::Append(x) => self.e(x, site),
             Expr::Block(block) => {
@@ -764,7 +780,15 @@ impl<'a> Scan<'a> {
                 self.oe(value, site)
             }
             Expr::Continue { label } => self.ob(label, site),
-            Expr::Return(x) | Expr::Yield(x) => self.oe(x, site),
+            Expr::Return(x) => self.oe(x, site),
+            Expr::Yield { key, value } => {
+                self.oe(key, site)?;
+                self.oe(value, site)?;
+                if key.is_some() && value.is_none() {
+                    return Err(malformed(site, Malformed::YieldKey));
+                }
+                Ok(())
+            }
             Expr::Closure(c) => {
                 self.params(c.params, site, true)?;
                 self.ot(c.ret, site)?;
@@ -975,6 +999,12 @@ impl<'a> Scan<'a> {
             Ty::Infer | Ty::Prim(_) | Ty::Any | Ty::Never | Ty::SelfTy | Ty::Err => Ok(()),
             Ty::Path(p) => self.pa(p, site),
             Ty::Tuple(ts) => self.tys(ts, site),
+            Ty::Union(ts) | Ty::Intersection(ts) => {
+                self.tys(ts, site)?;
+                let members = self.list(ts, site)?;
+                crate::canon::check(self.s, members, matches!(ty, Ty::Union(_)))
+                    .map_err(|problem| malformed(site, problem))
+            }
             Ty::Object(bs) | Ty::Impl(bs) => self.bounds(bs, site),
             Ty::Array { elem, len } => {
                 self.t(elem, site)?;
@@ -1057,5 +1087,6 @@ const fn compound_op(kind: OpKind) -> bool {
             | OpKind::Xor
             | OpKind::Shl
             | OpKind::Shr
+            | OpKind::Pow
     )
 }

@@ -15,18 +15,6 @@ use crate::{
     walk::{BindSite, FrameOf, Mark, Step, expand},
 };
 
-/// What earlier repairs made dead or unbound, so their consequences are fixed
-/// silently instead of reported again.
-#[derive(Default)]
-pub(crate) struct Cascades {
-    /// Nodes that became unreachable because an ancestor was repaired.
-    pub(crate) dead: BTreeSet<NodeRef>,
-    /// Binders whose binding site was removed by a repair.
-    pub(crate) lost: BTreeSet<BinderId>,
-    /// Report nothing (consequences of an earlier round's repairs).
-    pub(crate) quiet: bool,
-}
-
 type R = Result<(), HirError>;
 
 /// Walks the tree from `root`, then checks reachability and scopes. Returns
@@ -36,9 +24,8 @@ pub(crate) fn walk(
     root: ItemId,
     ctx: Ctx,
     sink: &mut Sink,
-    cascades: &Cascades,
 ) -> Result<Index, HirError> {
-    let mut walker = Walker::new(store, ctx, sink, cascades);
+    let mut walker = Walker::new(store, ctx, sink);
     walker.walk(root)?;
     walker.finish()
 }
@@ -60,8 +47,6 @@ struct FrameInfo {
     tries: u32,
     /// Open `defer` bodies: no jump may leave, no `return`.
     defers: u32,
-    /// Open `defer` or `finally` bodies: no `yield`.
-    cleanups: u32,
     integer_const: bool,
 }
 
@@ -116,7 +101,6 @@ struct Walker<'a, 's> {
     s: &'a Store,
     ctx: Ctx,
     sink: &'s mut Sink,
-    cascades: &'a Cascades,
     seen: [Vec<bool>; 9],
     pos: u32,
     ancestors: Vec<NodeRef>,
@@ -146,13 +130,12 @@ struct Walker<'a, 's> {
 }
 
 impl<'a, 's> Walker<'a, 's> {
-    fn new(s: &'a Store, ctx: Ctx, sink: &'s mut Sink, cascades: &'a Cascades) -> Self {
+    fn new(s: &'a Store, ctx: Ctx, sink: &'s mut Sink) -> Self {
         let binders = s.binders.len();
         Self {
             s,
             ctx,
             sink,
-            cascades,
             seen: [
                 alloc::vec![false; s.items.len()],
                 alloc::vec![false; s.exprs.len()],
@@ -186,7 +169,7 @@ impl<'a, 's> Walker<'a, 's> {
             expect_ns: None,
             index: Index {
                 path_pos: alloc::vec![UNSET; s.paths.len()],
-                path_floor: alloc::vec![[UNSET, UNSET, 0]; s.paths.len()],
+                path_floor: alloc::vec![[UNSET, UNSET, 0, UNSET]; s.paths.len()],
                 binder_scope: alloc::vec![[UNSET, UNSET]; binders],
                 binder_depth: alloc::vec![0; binders],
                 variant_owner: alloc::vec![UNSET; s.variants.len()],
@@ -197,11 +180,9 @@ impl<'a, 's> Walker<'a, 's> {
         }
     }
 
-    /// Reports a problem found by the walk (never a cascade of a pass-1 repair
-    /// unless the whole round is quiet).
+    /// Reports a problem found by the walk.
     fn report(&mut self, err: HirError, repair: Repair) -> R {
-        let show = !self.cascades.quiet;
-        self.sink.report(err, repair, show)
+        self.sink.report(err, repair, true)
     }
 
     fn walk(&mut self, root: ItemId) -> R {
@@ -217,7 +198,11 @@ impl<'a, 's> Walker<'a, 's> {
     }
 
     fn finish(mut self) -> Result<Index, HirError> {
-        // Unreachable nodes, in arena order. Error-form nodes may be dead.
+        // Unreachable nodes, in arena order. Error-form nodes may be dead. An
+        // orphaned subtree is reported once, at its top (strict mode: the
+        // first top in arena order); in lenient mode the nodes under it are
+        // repaired without a report of their own.
+        let mut orphans: Vec<NodeRef> = Vec::new();
         for slot in 0..9 {
             let len = self.seen.get(slot).map_or(0, Vec::len);
             for i in 0..len {
@@ -245,9 +230,35 @@ impl<'a, 's> Walker<'a, 's> {
                 if super::repair::is_dead_ok(self.s, node) {
                     continue;
                 }
-                let show = !self.cascades.quiet && !self.cascades.dead.contains(&node);
+                orphans.push(node);
+            }
+        }
+        if !orphans.is_empty() {
+            let below: BTreeSet<NodeRef> = {
+                let mut below = BTreeSet::new();
+                let mut steps = Vec::new();
+                for n in &orphans {
+                    steps.clear();
+                    expand(self.s, *n, &mut steps);
+                    for step in &steps {
+                        if let Step::Enter(child) = step {
+                            if child != n {
+                                let _ = below.insert(*child);
+                            }
+                        }
+                    }
+                }
+                below
+            };
+            // A cycle of orphans has no top: its first node stands for it.
+            let any_top = orphans.iter().any(|n| !below.contains(n));
+            for (i, node) in orphans.into_iter().enumerate() {
+                let top = !below.contains(&node) || (!any_top && i == 0);
+                if !self.sink.lenient && !top {
+                    continue;
+                }
                 self.sink
-                    .report(HirError::Unreachable { node }, Repair::ErrNode(node), show)?;
+                    .report(HirError::Unreachable { node }, Repair::ErrNode(node), top)?;
             }
         }
         for (i, path) in self.s.paths.nodes.iter().enumerate() {
@@ -265,9 +276,8 @@ impl<'a, 's> Walker<'a, 's> {
             }
             let id = PathId::from_raw_index(len_u32(i));
             if let Err(e) = check_local(self.s, &self.index, id, binder) {
-                let show = !self.cascades.quiet && !self.cascades.lost.contains(&binder);
                 self.sink
-                    .report(e, Repair::ResErr { path: id, ns: None }, show)?;
+                    .report(e, Repair::ResErr { path: id, ns: None }, true)?;
             }
         }
         build_locals(self.s, &mut self.index);
@@ -345,7 +355,7 @@ impl<'a, 's> Walker<'a, 's> {
                     } else {
                         matches!(kind, Some(BinderKind::TypeParam | BinderKind::Region))
                     };
-                    if !ok {
+                    if !ok && !self.is_bound(gp.binder) {
                         let expected = if gp.ty.is_some() {
                             BinderKind::ConstParam
                         } else {
@@ -380,9 +390,9 @@ impl<'a, 's> Walker<'a, 's> {
                 }
                 self.pending.truncate(start);
             }
-            Mark::BindDecl(b) => {
+            Mark::BindDecl(b, kind) => {
                 let owner = self.ancestors.last().copied();
-                self.expect_kind(b, BinderKind::Local)?;
+                self.expect_kind(b, kind)?;
                 self.bind(b, owner, owner.map(Repair::ErrNode))?;
             }
             Mark::Captures(list) => {
@@ -442,21 +452,13 @@ impl<'a, 's> Walker<'a, 's> {
             Mark::Try => self.frame_mut(|f| f.tries += 1),
             Mark::PopTry => self.frame_mut(|f| f.tries = f.tries.saturating_sub(1)),
             Mark::Defer => {
-                self.frame_mut(|f| {
-                    f.defers += 1;
-                    f.cleanups += 1;
-                });
+                self.frame_mut(|f| f.defers += 1);
                 self.jump_floors.push(len_u32(self.loops.len()));
             }
             Mark::PopDefer => {
-                self.frame_mut(|f| {
-                    f.defers = f.defers.saturating_sub(1);
-                    f.cleanups = f.cleanups.saturating_sub(1);
-                });
+                self.frame_mut(|f| f.defers = f.defers.saturating_sub(1));
                 let _ = self.jump_floors.pop();
             }
-            Mark::Finally => self.frame_mut(|f| f.cleanups += 1),
-            Mark::PopFinally => self.frame_mut(|f| f.cleanups = f.cleanups.saturating_sub(1)),
             Mark::ExpectNs(ns) => self.expect_ns = Some(ns),
             Mark::Open(_) | Mark::Close => {}
         }
@@ -475,8 +477,15 @@ impl<'a, 's> Walker<'a, 's> {
         self.s.binder(b).map(|b| b.kind)
     }
 
+    fn is_bound(&self, binder: BinderId) -> bool {
+        self.bound.get(binder.index()).copied().unwrap_or(true)
+    }
+
+    /// Checks a binder's kind at its binding site. A second site is reported
+    /// by [`bind`](Self::bind) instead, so a repair never changes the kind of
+    /// a binder that is already bound elsewhere.
     fn expect_kind(&mut self, binder: BinderId, expected: BinderKind) -> R {
-        if self.binder_kind(binder) == Some(expected) {
+        if self.is_bound(binder) || self.binder_kind(binder) == Some(expected) {
             Ok(())
         } else {
             self.report(
@@ -609,7 +618,6 @@ impl<'a, 's> Walker<'a, 's> {
             loop_base: len_u32(self.loops.len()),
             tries: 0,
             defers: 0,
-            cleanups: 0,
             integer_const,
         });
         self.jump_floors.push(len_u32(self.loops.len()));
@@ -729,13 +737,9 @@ impl<'a, 's> Walker<'a, 's> {
                 Some(f) if f.effects.contains(Effects::ASYNC) => None,
                 _ => Some(effect(id, EffectProblem::AwaitOutsideAsync)),
             },
-            Expr::Yield(_) => match self.frames.last() {
-                Some(f) if !f.effects.contains(Effects::YIELD) => {
-                    Some(effect(id, EffectProblem::YieldOutsideGenerator))
-                }
-                Some(f) if f.cleanups > 0 => Some(effect(id, EffectProblem::YieldInCleanup)),
-                Some(_) => None,
-                None => Some(effect(id, EffectProblem::YieldOutsideGenerator)),
+            Expr::Yield { .. } | Expr::YieldFrom(_) => match self.frames.last() {
+                Some(f) if f.effects.contains(Effects::YIELD) => None,
+                _ => Some(effect(id, EffectProblem::YieldOutsideGenerator)),
             },
             Expr::Throw(_) => match self.frames.last() {
                 Some(f) if f.effects.contains(Effects::THROWS) || f.tries > 0 => None,
@@ -822,9 +826,10 @@ impl<'a, 's> Walker<'a, 's> {
         if let Some(slot) = self.index.path_pos.get_mut(id.index()) {
             *slot = pos;
         }
-        let floors = self.floors.last().copied().unwrap_or([0, 0, UNSET]);
+        let [value_floor, type_floor, ceiling] =
+            self.floors.last().copied().unwrap_or([0, 0, UNSET]);
         if let Some(slot) = self.index.path_floor.get_mut(id.index()) {
-            *slot = floors;
+            *slot = [value_floor, type_floor, ceiling, len_u32(self.frames.len())];
         }
         if path.ns != expected {
             return self.report(
@@ -870,15 +875,7 @@ impl<'a, 's> Walker<'a, 's> {
                 // The root of a binding construct: its binders form one group.
                 let start = start.min(self.scratch.len());
                 let end = self.scratch.len();
-                if let Some(dup) = self.first_dup(start, end) {
-                    self.report(
-                        HirError::DuplicateBinding {
-                            binder: dup.binder,
-                            pat: id,
-                        },
-                        Repair::WildPat(dup.pat),
-                    )?;
-                }
+                self.report_dups(id, start, end)?;
                 self.groups.push(len_u32(self.pending.len()));
                 self.pending.extend(self.scratch.drain(start..));
             }
@@ -897,19 +894,48 @@ impl<'a, 's> Walker<'a, 's> {
         self.generation
     }
 
-    /// The first entry of `scratch[start..end]`, in order, whose binder an
-    /// earlier entry in the range already binds. Linear.
-    fn first_dup(&mut self, start: usize, end: usize) -> Option<Bound> {
+    /// Reports every entry of `scratch[start..end]` whose binder an earlier
+    /// entry in the range already binds (in order; strict mode stops at the
+    /// first), then removes those repeats so the construct binds each binder
+    /// once. The repair turns each repeat into a wildcard, which leaves the
+    /// set of binders and their first modes unchanged. Linear.
+    fn report_dups(&mut self, pat: PatId, start: usize, end: usize) -> R {
+        let end = end.min(self.scratch.len());
+        let start = start.min(end);
         let g = self.next_generation();
-        for i in start..end {
-            let entry = self.scratch.get(i).copied()?;
-            let slot = self.stamp_a.get_mut(entry.binder.index())?;
-            if *slot == g {
-                return Some(entry);
+        let mut write = start;
+        for read in start..end {
+            let Some(entry) = self.scratch.get(read).copied() else {
+                continue;
+            };
+            let repeat = match self.stamp_a.get_mut(entry.binder.index()) {
+                Some(slot) if *slot == g => true,
+                Some(slot) => {
+                    *slot = g;
+                    false
+                }
+                None => false,
+            };
+            if repeat {
+                self.report(
+                    HirError::DuplicateBinding {
+                        binder: entry.binder,
+                        pat,
+                    },
+                    Repair::WildPat(entry.pat),
+                )?;
+                continue;
             }
-            *slot = g;
+            if let Some(slot) = self.scratch.get_mut(write) {
+                *slot = entry;
+            }
+            write += 1;
         }
-        None
+        // Close the gap left by removed repeats.
+        if write < end {
+            let _ = self.scratch.drain(write..end);
+        }
+        Ok(())
     }
 
     /// Checks that every alternative binds the same set with the same modes,
@@ -934,29 +960,30 @@ impl<'a, 's> Walker<'a, 's> {
             lo..hi.max(lo)
         };
         let first = range(0);
-        if let Some(dup) = self.first_dup(first.start, first.end) {
-            self.report(
-                HirError::DuplicateBinding {
-                    binder: dup.binder,
-                    pat: id,
-                },
-                Repair::WildPat(dup.pat),
-            )?;
-        }
-        // Stamp the first alternative's set (generation `g0`) and modes.
+        // Stamp the first alternative's set (generation `g0`) and modes. A
+        // repeated binder keeps its first mode: the repeat is reported below
+        // and becomes a wildcard, so the repaired pattern agrees with this.
         let g0 = self.next_generation();
+        let mut first_count = 0usize;
         for i in first.clone() {
             if let Some(e) = self.scratch.get(i).copied() {
-                if let Some(s) = self.stamp_a.get_mut(e.binder.index()) {
-                    *s = g0;
-                }
-                if let Some(m) = self.mode_a.get_mut(e.binder.index()) {
-                    *m = e.mode;
+                let fresh = match self.stamp_a.get_mut(e.binder.index()) {
+                    Some(s) if *s == g0 => false,
+                    Some(s) => {
+                        *s = g0;
+                        true
+                    }
+                    None => false,
+                };
+                if fresh {
+                    first_count += 1;
+                    if let Some(m) = self.mode_a.get_mut(e.binder.index()) {
+                        *m = e.mode;
+                    }
                 }
             }
         }
-        let first_count = first.len();
-        let mut problem = None;
+        let mut problems: Vec<(HirError, Repair)> = Vec::new();
         for alt in 1..bounds.len() {
             let gi = self.next_generation();
             let mut count = 0usize;
@@ -966,16 +993,13 @@ impl<'a, 's> Walker<'a, 's> {
                 };
                 let b = e.binder.index();
                 if self.stamp_b.get(b) == Some(&gi) {
-                    first_problem(
-                        &mut problem,
-                        (
-                            HirError::DuplicateBinding {
-                                binder: e.binder,
-                                pat: id,
-                            },
-                            Repair::WildPat(e.pat),
-                        ),
-                    );
+                    problems.push((
+                        HirError::DuplicateBinding {
+                            binder: e.binder,
+                            pat: id,
+                        },
+                        Repair::WildPat(e.pat),
+                    ));
                     continue;
                 }
                 if let Some(s) = self.stamp_b.get_mut(b) {
@@ -983,40 +1007,42 @@ impl<'a, 's> Walker<'a, 's> {
                 }
                 count += 1;
                 if self.stamp_a.get(b) != Some(&g0) {
-                    first_problem(
-                        &mut problem,
-                        (
-                            HirError::OrPatternBinders { pat: id },
-                            Repair::ErrNode(NodeRef::Pat(id)),
-                        ),
-                    );
+                    problems.push((
+                        HirError::OrPatternBinders { pat: id },
+                        Repair::ErrNode(NodeRef::Pat(id)),
+                    ));
                 } else if self.mode_a.get(b) != Some(&e.mode) {
-                    first_problem(
-                        &mut problem,
-                        (
-                            HirError::Malformed {
-                                site: Site::Node(NodeRef::Pat(id)),
-                                problem: Malformed::OrPatternModes,
-                            },
-                            Repair::ErrNode(NodeRef::Pat(id)),
-                        ),
-                    );
+                    problems.push((
+                        HirError::Malformed {
+                            site: Site::Node(NodeRef::Pat(id)),
+                            problem: Malformed::OrPatternModes,
+                        },
+                        Repair::ErrNode(NodeRef::Pat(id)),
+                    ));
                 }
             }
             if count != first_count {
-                first_problem(
-                    &mut problem,
-                    (
-                        HirError::OrPatternBinders { pat: id },
-                        Repair::ErrNode(NodeRef::Pat(id)),
-                    ),
-                );
+                problems.push((
+                    HirError::OrPatternBinders { pat: id },
+                    Repair::ErrNode(NodeRef::Pat(id)),
+                ));
             }
         }
-        // `next_generation` may have cleared stamps on wrap; generations are
-        // only compared within this call, after the clear.
-        self.scratch.truncate(first_start.min(end) + first_count);
-        if let Some((err, repair)) = problem {
+        // Keep one copy of the binders (the first alternative's), reporting
+        // and dropping its repeats first, then the other alternatives'
+        // problems in the order found (strict mode stops at the first). An
+        // or-pattern repaired as a whole is reported once.
+        let first_start = first_start.min(end);
+        self.scratch.truncate(first_start + first.len());
+        self.report_dups(id, first_start, first_start + first.len())?;
+        let mut whole = false;
+        for (err, repair) in problems {
+            if matches!(repair, Repair::ErrNode(_)) {
+                if whole {
+                    continue;
+                }
+                whole = true;
+            }
             self.report(err, repair)?;
         }
         Ok(())
@@ -1031,12 +1057,5 @@ fn malformed_expr(expr: ExprId, problem: Malformed) -> HirError {
     HirError::Malformed {
         site: Site::Node(NodeRef::Expr(expr)),
         problem,
-    }
-}
-
-/// Keeps the first problem found.
-fn first_problem(slot: &mut Option<(HirError, Repair)>, problem: (HirError, Repair)) {
-    if slot.is_none() {
-        *slot = Some(problem);
     }
 }

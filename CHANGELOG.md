@@ -13,6 +13,77 @@
 
 ---
 
+## [0.4.0] - 2026-10-09
+
+A breaking 0.x revision for the HIR gaps that writing the LSF2 spec and the Mox
+sketch found (ISSUES P12, P13, P20–P23): union and intersection types, place-once
+compound assignment and the value of assignments, keyed yields and `yield from`,
+logical versus bitwise `not`, the `NoMatch` runtime error, `pow` and
+`shift = saturate` from OPS v2, lenient repair proven to need at most two rounds,
+and `lookup_local_in`. The spec `specs/HIR.md` is revised to v3.
+
+### Breaking
+
+- **`Expr::Yield(Option<ExprId>)` is now `Expr::Yield { key, value }`** (PHP/Mox
+  `yield $k => $v`); `Expr::YieldFrom(ExprId)` and `Expr::LetPlace { binder, place,
+  body }` are new expression forms, and `Ty::Union` / `Ty::Intersection` new type
+  forms, so exhaustive matches on `Expr` and `Ty` need arms for them.
+- **`OpKind::Not` is logical negation only**; the bitwise complement is the new
+  `OpKind::BitNot` (`bit_not`). Lowerings that used `not` on integers must switch.
+  `OpKind::Pow` is new, and `Shift::Saturate` is a new policy value.
+- **`BinderKind::Place`** is new (the binder of `let_place`); exhaustive matches on
+  `BinderKind` need it.
+- **`EffectProblem::YieldInCleanup` is removed**: a `yield` inside `finally` or
+  `defer` is valid (LSB rule 12; yielding while a generator is being closed is a
+  run-time error, `CloseIgnored`).
+- **New `Malformed` problems**: `TypeArity`, `TypeNesting`, `TypeOrder`, `YieldKey`.
+- **`finish` and `finish_lenient` normalize unions and intersections** before
+  validating (flatten, hoist `Nullable`, sort, drop repeats, collapse a single
+  member), so a union node may come back sorted, wrapped in `Nullable`, or replaced
+  by its only member.
+- **Unreachable reporting**: an orphaned subtree is reported once, at its top (strict
+  mode: the first top in arena order; before, the first orphan in arena order,
+  usually a child).
+- **Lenient repair** reports a duplicate binding at every repeat (not just the
+  first) and every problem of an or-pattern's alternatives; a second binding site is
+  reported as `BinderBoundTwice` without a kind change for the binder.
+
+### Added
+
+- **Union and intersection types** (P20) with a canonical form (spec §5.1): at
+  least two members, no same-kind nesting (no `Nullable` in a union), members
+  strictly ordered by a resolution-independent key; members with error forms,
+  constant expressions, or more than 64 nodes are exempt, which keeps every check
+  linear.
+- **`Expr::LetPlace`** (P21): evaluate a place's operands once and name the place,
+  for `.=` with a host operator, `**=`, `%=`, `??=`, and `++`/`--` templates; the
+  alias crosses no frame. `Assign` is documented to evaluate to the assigned value,
+  and the spec gives bcgen-lang's lowering of both.
+- **Keyed `Yield` and `YieldFrom`** (P22), mapped onto LSB `yield_kv` and a
+  delegation loop; the **`NoMatch`** runtime error (E0200, in the new HIR range
+  E0200–E0299) for a `match` without a matching arm.
+- **`OpKind::Pow`, `OpKind::BitNot`, `Shift::Saturate`** (P22/P23, OPS v2); `pow`
+  is a valid compound operator and consults `overflow` (`promote` allowed on dynamic
+  results).
+- **`Hir::lookup_local_in(path, name, ns)`** (P13).
+- Tests: `tests/features_0_4.rs` (20), canonical-form unit tests (6), a §9.6 spec
+  example (Mox `.=` with a union parameter), the garbage generator extended with
+  the 0.4 forms; benchmarks for 100,000 unions and a 100,000-deep union nest.
+
+### Fixed
+
+- **Lenient repair terminates in at most two rounds without a fallback** (P12).
+  Each round now removes the consequences of its own repairs (nodes it cut off,
+  references to binders whose site disappeared or whose kind it changed) before
+  the next pass, and reports every later-round problem instead of treating it as a
+  cascade. The 0.3 loop (16 rounds, then emptying the root module) is gone; a
+  debug assertion checks the bound under the lenient property tests, and a hard
+  limit turns a broken argument into an error rather than a hang.
+- The or-pattern check kept the *last* binding mode of a repeated binder in the
+  first alternative; it keeps the first, matching the repair.
+
+---
+
 ## [0.3.0] - 2026-10-08
 
 A breaking 0.x revision that closes the design gaps an adversarial review of
@@ -189,7 +260,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/hir-lang/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/hir-lang/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/hir-lang/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/hir-lang/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/hir-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/hir-lang/releases/tag/v0.1.0

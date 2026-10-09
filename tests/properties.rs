@@ -865,7 +865,8 @@ fn apply_raw(b: &mut Builder, sym: Symbol, step: &RawStep) {
     if step.c % 7 == 0 {
         b.set_expansion(ExpnId::from_u32(u32::from(step.c % 3)));
     }
-    match step.kind % 32 {
+    let t = |x: u8| hir_lang::TyId::from_index(n(x)).unwrap();
+    match step.kind % 41 {
         0 => {
             let _ = b.int(i64::from(step.a));
         }
@@ -983,6 +984,7 @@ fn apply_raw(b: &mut Builder, sym: Symbol, step: &RawStep) {
                 BinderKind::Label,
                 BinderKind::TypeParam,
                 BinderKind::Capture,
+                BinderKind::Place,
             ];
             let _ = b.binder(Binder::new(Name::new(sym), kinds[n(step.a) % kinds.len()]));
         }
@@ -1059,6 +1061,53 @@ fn apply_raw(b: &mut Builder, sym: Symbol, step: &RawStep) {
         }
         29 => {
             let _ = b.expr(Expr::Throw(e(step.a)));
+        }
+        31 => {
+            let l = b.list(&[t(step.a), t(step.b)]);
+            let _ = b.ty(if step.c % 2 == 0 {
+                hir_lang::Ty::Union(l)
+            } else {
+                hir_lang::Ty::Intersection(l)
+            });
+        }
+        32 => {
+            let _ = b.ty(hir_lang::Ty::Nullable(t(step.a)));
+        }
+        33 => {
+            let _ = b.ty(hir_lang::Ty::Path(pa(step.a)));
+        }
+        34 => {
+            let _ = b.expr(Expr::LetPlace {
+                binder: bi(step.a),
+                place: e(step.b),
+                body: e(step.c),
+            });
+        }
+        35 => {
+            let _ = b.expr(Expr::Yield {
+                key: (step.c % 3 == 0).then(|| e(step.a)),
+                value: (step.c % 2 == 0).then(|| e(step.b)),
+            });
+        }
+        36 => {
+            let _ = b.expr(Expr::YieldFrom(e(step.a)));
+        }
+        37 => {
+            let _ = b.expr(Expr::Assign {
+                target: e(step.a),
+                op: Some(hir_lang::Op::new(OpKind::Pow)),
+                value: e(step.b),
+            });
+        }
+        38 => {
+            let _ = b.pat(Pat::Range {
+                lo: Some(p(step.a)),
+                hi: (step.c % 2 == 0).then(|| p(step.b)),
+                inclusive: true,
+            });
+        }
+        39 => {
+            let _ = b.op(OpKind::BitNot, &[e(step.a)]);
         }
         30 => {
             let _ = b.pat(Pat::Tuple {

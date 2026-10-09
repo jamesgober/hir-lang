@@ -147,6 +147,16 @@ pub enum Malformed {
     /// An or-pattern alternative binds a binder with a different binding mode
     /// than the first alternative.
     OrPatternModes,
+    /// A union or intersection has fewer than two members (spec §5.1).
+    TypeArity,
+    /// A union contains a union or a `Nullable`, or an intersection an
+    /// intersection, directly (spec §5.1).
+    TypeNesting,
+    /// Union or intersection members are not in canonical order, or one
+    /// repeats (spec §5.1).
+    TypeOrder,
+    /// A `yield` has a key but no value.
+    YieldKey,
 }
 
 impl fmt::Display for Malformed {
@@ -199,6 +209,12 @@ impl fmt::Display for Malformed {
             Self::PlaceArg => "a place argument must be a non-spread place expression",
             Self::AppendContext => "an append place can only be written to",
             Self::OrPatternModes => "or-pattern alternatives bind a binder with different modes",
+            Self::TypeArity => "a union or intersection has fewer than two members",
+            Self::TypeNesting => {
+                "a union or intersection directly contains one of its own kind (or a union a nullable type)"
+            }
+            Self::TypeOrder => "union or intersection members are not in canonical order, or repeat",
+            Self::YieldKey => "a `yield` with a key needs a value",
         })
     }
 }
@@ -263,9 +279,6 @@ pub enum EffectProblem {
     YieldOutsideGenerator,
     /// `throw` in a frame without `THROWS` and outside a `try` body.
     ThrowNotAllowed,
-    /// `yield` inside a `defer` or `finally` body (cleanup may run while a
-    /// generator is being closed, when it cannot yield).
-    YieldInCleanup,
 }
 
 impl fmt::Display for EffectProblem {
@@ -275,7 +288,6 @@ impl fmt::Display for EffectProblem {
             Self::AwaitOutsideAsync => "`await` outside an async function",
             Self::YieldOutsideGenerator => "`yield` outside a generator",
             Self::ThrowNotAllowed => "`throw` in a function that does not throw, outside `try`",
-            Self::YieldInCleanup => "`yield` inside a `defer` or `finally` body",
         })
     }
 }

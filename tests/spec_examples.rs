@@ -434,3 +434,94 @@ const IRON: &str = r#"(module
       (default
         (lit "app")))
     (block)))"#;
+
+/// §9.6 Mox: a union parameter type and `$a[$k] .= "!"`, whose place is
+/// evaluated once through `let_place` (the compound template's binder).
+#[test]
+fn test_spec_example_mox_compound_assignment() {
+    let mut k = Kit::new();
+    // function tag(string|int|null $k, array $a) { $a[$k] .= "!"; }
+    let st = k.b.ty(Ty::Prim(Prim::Str));
+    let int = k.b.ty(Ty::Prim(Prim::I64));
+    let members = k.b.list(&[st, int]);
+    let union = k.b.ty(Ty::Union(members));
+    let k_ty = k.b.ty(Ty::Nullable(union));
+    let kb = k.binder("k", BinderKind::Param);
+    let k_pat = k.b.bind(kb);
+    let pk = k.b.param(Param {
+        ty: Some(k_ty),
+        ..Param::new(k_pat)
+    });
+    let a_name = k.name("a");
+    let (pa, ab) = k.b.local_param(a_name);
+    let compound = k.sym("compound_assign");
+    let e1 = k.b.expansion(hir_lang::Expansion {
+        kind: hir_lang::ExpnKind::Template,
+        name: compound,
+        call_site: Span::empty(0),
+        parent: hir_lang::ExpnId::ROOT,
+        def_site: hir_lang::ExpnId::ROOT,
+    });
+    let (ua, uk) = (k.b.use_binder(ab), k.b.use_binder(kb));
+    let place = k.b.expr(Expr::Index {
+        base: ua,
+        index: uk,
+    });
+    k.b.set_expansion(e1);
+    let p_sym = k.sym("p");
+    let p = k.b.binder(hir_lang::Binder::new(
+        Name::marked(p_sym, e1),
+        BinderKind::Place,
+    ));
+    let target = k.b.use_binder(p);
+    let read = k.b.use_binder(p);
+    let concat_name = k.name("concat");
+    let concat_sym = k.sym("mox.concat");
+    let concat =
+        k.b.resolved_path(concat_name, Ns::Value, Res::Extern(concat_sym));
+    let concat = k.b.expr(Expr::Path(concat));
+    k.b.set_expansion(hir_lang::ExpnId::ROOT);
+    let bang = k.b.str_lit("!");
+    k.b.set_expansion(e1);
+    let value = k.b.call(concat, &[read, bang]);
+    let assign = k.b.expr(Expr::Assign {
+        target,
+        op: None,
+        value,
+    });
+    let let_place = k.b.expr(Expr::LetPlace {
+        binder: p,
+        place,
+        body: assign,
+    });
+    k.b.set_expansion(hir_lang::ExpnId::ROOT);
+    let stmt = k.b.expr_stmt(let_place);
+    let body = k.b.block(&[stmt], None);
+    let tag = k.func_fx("tag", &[pk, pa], Effects::NONE, body);
+    let (hir, names) = k.finish_items_keep(&[tag]);
+    let hir = hir.unwrap();
+    check(&hir, &names, MOX_COMPOUND);
+}
+
+const MOX_COMPOUND: &str = r#"(module
+  (fn tag
+    (param normal
+      (bind k%0)
+      (nullable
+        (union
+          (prim i64)
+          (prim str))))
+    (param normal
+      (bind a%1))
+    (block
+      (do
+        (let-place p%2'e1
+          (index
+            (use (path a → local a%1))
+            (use (path k → local k%0)))
+          (assign
+            (use (path p'e1 → local p%2'e1))
+            (call
+              (use (path concat → extern mox.concat))
+              (use (path p'e1 → local p%2'e1))
+              (lit "!"))))))))"#;

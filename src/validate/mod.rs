@@ -8,7 +8,8 @@
 //!
 //! In strict mode the first problem is returned. In lenient mode every problem
 //! is collected with a [`Repair`]; [`repair`] applies them (turning offending
-//! nodes into error nodes) and validates again until the store is clean.
+//! nodes into error nodes), removes their consequences, and validates again;
+//! at most two rounds are needed.
 
 mod repair;
 mod scan;
@@ -57,8 +58,9 @@ pub(crate) struct LocalEntry {
 pub(crate) struct Index {
     /// Preorder position of each path.
     pub(crate) path_pos: Vec<u32>,
-    /// `[value floor, type floor, value ceiling]` at each path (spec §3.2).
-    pub(crate) path_floor: Vec<[u32; 3]>,
+    /// `[value floor, type floor, value ceiling, frame depth]` at each path
+    /// (spec §3.2).
+    pub(crate) path_floor: Vec<[u32; 4]>,
     /// `[start, end)` preorder range in which each binder is visible.
     pub(crate) binder_scope: Vec<[u32; 2]>,
     /// The frame depth at which each binder was bound.
@@ -114,7 +116,8 @@ impl Sink {
     }
 
     /// Records a problem (lenient) or fails (strict). `report` is `false` for
-    /// cascades of earlier repairs, which are fixed but not shown.
+    /// a problem that another reported problem already covers (a node inside
+    /// an orphaned subtree), which is repaired but not shown.
     pub(crate) fn report(
         &mut self,
         err: HirError,
@@ -135,7 +138,7 @@ pub(crate) fn validate(store: &Store, root: ItemId, ctx: Ctx) -> Result<Index, H
     preflight(store, root)?;
     let mut sink = Sink::strict();
     scan::scan(store, root, ctx, &mut sink)?;
-    tree::walk(store, root, ctx, &mut sink, &tree::Cascades::default())
+    tree::walk(store, root, ctx, &mut sink)
 }
 
 /// The fatal checks: capacity and the root. No mode can repair these.
@@ -187,13 +190,18 @@ pub(crate) fn check_local(
         return Err(HirError::OutOfScope { path, binder });
     }
     let depth = index.binder_depth.get(binder.index()).copied().unwrap_or(0);
-    let [value_floor, type_floor, value_ceiling] = index
+    let [value_floor, type_floor, value_ceiling, path_depth] = index
         .path_floor
         .get(path.index())
         .copied()
-        .unwrap_or([UNSET, UNSET, 0]);
-    let value = store.binder(binder).is_some_and(|b| b.kind.is_value());
-    let ok = if value {
+        .unwrap_or([UNSET, UNSET, 0, UNSET]);
+    let kind = store.binder(binder).map(|b| b.kind);
+    let value = kind.is_some_and(BinderKind::is_value);
+    // A place alias names operands evaluated in its own frame: no frame of
+    // any kind may lie between it and its use.
+    let ok = if kind == Some(BinderKind::Place) {
+        depth == path_depth
+    } else if value {
         depth >= value_floor && depth < value_ceiling
     } else {
         depth >= type_floor

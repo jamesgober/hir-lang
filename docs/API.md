@@ -1,10 +1,13 @@
 # hir-lang &mdash; API Reference
 
 > Complete reference for every public item in `hir-lang`, with examples.
-> **Status: pre-1.0 (0.3.0).** 0.3 is a breaking revision of 0.2 that closes
-> the design gaps an adversarial review found (units and cross-unit
-> definitions, partial resolution, lenient validation, PHP/Mox forms,
-> low-level forms). The surface is frozen only after lower-lang,
+> **Status: pre-1.0 (0.4.0).** 0.4 is a breaking revision of 0.3 for gaps the
+> LSF2 spec and the Mox sketch found: union and intersection types, place-once
+> compound assignment and the value of assignments, keyed yields and
+> `yield from`, logical versus bitwise `not`, `pow` and `shift = saturate`
+> (OPS v2), lenient repair in at most two rounds, and `lookup_local_in`. (0.3
+> closed the review gaps of 0.2: units, partial resolution, lenient
+> validation, PHP/Mox and low-level forms.) The surface is frozen only after lower-lang,
 > resolve-lang, and typeck-lang have used it end to end (LexerSketch decision
 > D18). The normative definition of HIR is the LexerSketch spec
 > `specs/HIR.md`; this file documents the Rust API that implements it. See
@@ -58,7 +61,7 @@
 | Item | Kind | Purpose |
 |---|---|---|
 | [`Builder`](#builder) | struct | Creates nodes, lists, text, attributes, expansions; copies subtrees; `finish` / `finish_lenient` validate. |
-| [`Hir`](#hir) | struct | A validated HIR of one unit: accessors, `resolve`/`resolve_partial`, `lookup_local`, `can_reference`, implicit captures, walking. |
+| [`Hir`](#hir) | struct | A validated HIR of one unit: accessors, `resolve`/`resolve_partial`, `lookup_local`/`lookup_local_in`, `can_reference`, implicit captures, walking. |
 | [`walk`](#walk), [`print`](#print), [`print_with`](#print_with), [`print_into`](#print_into) | functions | The Tier-1 traversal and the debug printer. |
 | [`UnitId`](#unitid), [`DefId`](#defid), [`Def`](#def) | types | Compilation units and definitions across units. |
 | [`Item`](#item), [`ItemKind`](#itemkind) and the `*Def` records | types | Declarations. |
@@ -78,7 +81,7 @@
 
 ```toml
 [dependencies]
-hir-lang = "0.3"
+hir-lang = "0.4"
 intern-lang = "1"   # names are intern_lang::Symbol
 ```
 
@@ -86,7 +89,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-hir-lang = { version = "0.3", default-features = false }
+hir-lang = { version = "0.4", default-features = false }
 ```
 
 ## Quick start
@@ -165,7 +168,7 @@ can never be confused with user variables of the same spelling.
 
 ### Binders, scopes, and frames
 
-Variables, parameters, captures, generic parameters, and labels are
+Variables, parameters, captures, generic parameters, place aliases, and labels are
 [`Binder`](#binder)s with unique ids. Each is bound by at most one construct
 (the alternatives of an or-pattern bind the same set, with the same modes); a
 binder bound nowhere is allowed and is in no scope. A binder is visible:
@@ -176,6 +179,7 @@ binder bound nowhere is allowed and is in no scope. A binder is visible:
 | parameter pattern | later parameters' defaults (per-call evaluation), the return/throws types, the body |
 | `match`/`catch` arm pattern | the arm's guard and body |
 | explicit capture, a closure's `self_binder` | the closure's parameters and body |
+| [`Expr::LetPlace`](#expr) binder (kind `Place`) | the `let_place` body |
 | generic parameter | the whole item |
 | loop/block label | the loop's body and step, or the block |
 
@@ -184,7 +188,8 @@ defaults, and constant contexts (array lengths, const generic arguments,
 discriminants, field defaults) each start a frame. Value binders cross only
 closures that allow implicit captures, and parameter defaults; type-level
 binders also cross constant contexts and the member items of an impl,
-interface, or class. A default evaluated once at definition
+interface, or class. A `Place` binder crosses **no** frame (its operands live
+in the frame that evaluated them). A default evaluated once at definition
 ([`DefaultEval::Once`](#expr-records), Python) cannot see the function's own
 parameters. A module with a body is a frame like a function's.
 
@@ -199,8 +204,9 @@ type-directed resolution (`Vec::new`, `T::Item`, `Self::Output`).
 Lowering may fill slots it knows (template temporaries); resolve-lang fills
 the rest with [`Hir::resolve`](#hirresolve--hirresolve_partial) /
 `resolve_partial`, which check shape, namespace, scope, and frames in O(1)
-using the index the validator computed. [`Hir::lookup_local`](#hirlookup_local)
-answers "which binder named `x` is in scope here" in O(log n + d), and the walk
+using the index the validator computed. [`Hir::lookup_local`](#hirlookup_local--hirlookup_local_in)
+answers "which binder named `x` is in scope here" in O(log n + d) (and
+`lookup_local_in` the same in another namespace, for `T::new`), and the walk
 reports [scope, binder, and frame events](#event), so the resolver never
 re-derives the scope rules. The HIR stays valid after every call.
 
@@ -213,14 +219,16 @@ execution tier behaves the same. [`Op::new`](#op) gives the OPS defaults.
 
 ### Effects
 
-`throw`, `try`, `await`, `yield`, `spawn`, and `defer` are explicit forms.
-Functions, closures, and module bodies declare [`Effects`](#effects-1); the
-validator accepts `await` only in `ASYNC` frames, `yield` only in `YIELD`
-frames (and never inside a `defer` or `finally`, since cleanup runs when a
-generator is closed), and `throw` only in `THROWS` frames or inside a `try`
-body of the same frame. `ASYNC | YIELD` is an async generator. `return` needs a
-function, closure, or module body; jumps may leave a `finally` (overriding the
-pending completion) but never a `defer`.
+`throw`, `try`, `await`, `yield` (with an optional key), `yield from`,
+`spawn`, and `defer` are explicit forms. Functions, closures, and module bodies
+declare [`Effects`](#effects-1); the validator accepts `await` only in `ASYNC`
+frames, `yield` and `yield from` only in `YIELD` frames, and `throw` only in
+`THROWS` frames or inside a `try` body of the same frame. A `yield` inside a
+`finally` or `defer` is an ordinary suspension (LSB rule 12); only a generator
+that yields while being closed fails, at run time. `ASYNC | YIELD` is an async
+generator. `return` needs a function, closure, or module body; jumps may leave
+a `finally` (overriding the pending completion) but never a `defer`. A `match`
+with no matching arm raises the runtime error `NoMatch` (E0200, spec §8.10).
 
 Declared effects describe the explicit forms only: any fallible operation can
 raise at run time per the language's error model, and the body graph (spec
@@ -234,15 +242,21 @@ collects every problem, repairs each (the offending node becomes its error
 form, or a narrower fix: an error resolution, a wildcard binding, a corrected
 binder kind), and returns the valid `Hir` with the problems in source order;
 it fails only on capacity overflow or a root that is missing or not a module.
-Both are total (never panic) and linear. The checks, in order:
+Each round also removes the consequences of its own repairs (nodes cut off by a
+repair, references to binders whose site disappeared) without reporting them,
+so at most **two rounds** are needed: one for the node-local checks, one for
+the tree walk (spec §13.2). Both modes are total (never panic) and linear.
+Before validating, both normalize union and intersection types (spec §5.1).
+The checks, in order:
 
 1. every id, list, and text range in bounds; expansions ordered;
 2. each node's own shape: literals, op arity and policies, assignment and
-   place forms, parameter order, record shapes, unique member names, asm
-   templates, intrinsic orderings;
+   place forms (including `let_place`), parameter order, record shapes, unique
+   member names, asm templates, intrinsic orderings, keyed yields, and the
+   canonical form of unions and intersections;
 3. one walk checking the tree, binder sites, namespaces and path shapes,
    jumps, effects, and item placement;
-4. unreachable live nodes;
+4. unreachable live nodes (each orphaned subtree once, at its top);
 5. the scope and frames of every resolved local.
 
 ### Canonical order
@@ -524,9 +538,14 @@ overflowed; otherwise the first problem (see
 `finish_lenient` is for user code: every problem is collected and repaired,
 and the repaired, valid `Hir` is returned with the problems sorted by source
 position (span start, then discovery order). Consequences of a repair (the
-children of a replaced node, references to binders it bound) are fixed
-silently, not reported again. **Errors:** only where no repair exists:
-`CapacityExceeded`, a missing root (`Dangling`), or `RootNotModule`.
+children of a replaced node, references to binders it bound) are fixed in the
+same round, silently; at most two rounds are needed (spec §13.2). **Errors:**
+only where no repair exists: `CapacityExceeded`, a missing root (`Dangling`),
+or `RootNotModule`.
+
+Both first bring every union and intersection into canonical form (flatten,
+hoist `Nullable` out of unions, sort, drop repeats, collapse a single member;
+spec §5.1), so lowering builds them in source order and never compares types.
 
 ```rust
 use hir_lang::{Builder, Expr, HirError, IntLit, JumpProblem, Lit, NodeRef, Prim};
@@ -741,16 +760,20 @@ assert_eq!(hir.path(p).res, Res::Unresolved);
 # Ok::<(), hir_lang::HirError>(())
 ```
 
-### `Hir::lookup_local`
+### `Hir::lookup_local` / `Hir::lookup_local_in`
 
 ```rust,ignore
 pub fn lookup_local(&self, path: PathId, name: Name) -> Option<BinderId>
+pub fn lookup_local_in(&self, path: PathId, name: Name, ns: Ns) -> Option<BinderId>
 ```
 
 The lexically innermost binder named `name` (symbol and mark) in the path's
 namespace that is in scope at `path`, in O(log n + d) (d = nesting depth of
 same-named binders). Frames are not filtered: a result behind a frame the path
 may not cross is then reported by `resolve` as `NotCapturable`.
+`lookup_local_in` searches the namespace `ns` instead, for a prefix that lives
+elsewhere than the whole path (the type parameter `T` of the value path
+`T::new`); `Ns::Pattern` searches value binders, `Ns::Import` finds none.
 
 ```rust
 use hir_lang::{BinderKind, Builder, Expr, Name};
@@ -1037,7 +1060,8 @@ Attributes are data, never code. Attach with [`Builder::attach`](#builderattach)
 | `Cast { expr, ty, policy }` | `as`; policy has exactly `overflow` and `float_to_int` |
 | `Intrinsic { kind, generic_args, args }` | atomics, volatile, named intrinsics ([below](#intrinsic)) |
 | `Asm(Asm)` | structured inline assembly ([below](#asm)) |
-| `Assign { target, op, value }` | `target` must be a place; compound `op` only `add sub mul div floor_div rem floor_mod and or xor shl shr` |
+| `Assign { target, op, value }` | `target` must be a place, evaluated once; compound `op` only `add sub mul div floor_div rem floor_mod and or xor shl shr pow`; **evaluates to the value written** (`a = b = 3`) |
+| `LetPlace { binder, place, body }` | evaluate the operands of the place `place` **once** and name the place `binder` (kind `Place`) in `body`, for reads and writes: how `.=` with a host operator, `??=`, and `++`/`--` evaluate their place once; evaluates to `body` |
 | `RefAssign { target, source }` | `$a = &$b`: both places |
 | `Deref(ExprId)`, `Borrow { kind, expr }` | `*e`, `&e` / `&mut e` / raw |
 | `Block(Block)` | statements + tail + optional label |
@@ -1046,7 +1070,9 @@ Attributes are data, never code. Attach with [`Builder::attach`](#builderattach)
 | `Loop { label, body, step }` | the one loop; `step` runs after each iteration and on `continue` (a `continue` of this loop inside its own step is invalid) |
 | `Break { label, value }`, `Continue { label }`, `Return(Option)` | jumps; may leave `finally`, never `defer` |
 | `Closure(Closure)` | lambda with explicit or implicit captures |
-| `Throw`, `Try { body, catches, finally }`, `Await`, `Yield(Option)`, `Spawn` | effects |
+| `Throw`, `Try { body, catches, finally }`, `Await`, `Spawn` | effects |
+| `Yield { key, value }` | yield `value` (null if absent) under `key` (the runtime's automatic key if absent; a key needs a value); evaluates to the value sent |
+| `YieldFrom(ExprId)` | delegate to an inner generator or iterable, forwarding keys, sent values, and thrown errors; evaluates to its return value |
 | `Err` | failed to lower |
 
 **Places** are `Path`, `Field`, `DynField`, `Index`, `Deref`, `VarVar`,
@@ -1085,6 +1111,35 @@ let lp = b.expr(Expr::Loop { label: Some(l), body: brk, step: None });
 let body = b.expr(Expr::Block(Block { tail: Some(lp), ..Block::default() }));
 let f = b.func(Name::new(names.intern("f")), &[], body);
 let root = b.module(None, &[f]);
+assert!(b.finish(root).is_ok());
+```
+
+A compound assignment with a host operator, `$a[f()] .= "x"`, evaluates
+`$a` and `f()` once:
+
+```rust
+use hir_lang::{BinderKind, Builder, Expr, Name, Ns, Res};
+use intern_lang::Interner;
+
+let mut names = Interner::new();
+let mut b = Builder::new();
+let (pa, a) = b.local_param(Name::new(names.intern("a")));
+let f = b.name_expr(Name::new(names.intern("f")));
+let call_f = b.call(f, &[]);
+let base = b.use_binder(a);
+let place = b.expr(Expr::Index { base, index: call_f });
+// let_place p = $a[f()] in p = mox.concat(p, "x")
+let p = b.new_binder(Name::new(names.intern("p")), BinderKind::Place);
+let (target, read) = (b.use_binder(p), b.use_binder(p));
+let concat = b.resolved_path(Name::new(names.intern("concat")), Ns::Value, Res::Extern(names.intern("mox.concat")));
+let concat = b.expr(Expr::Path(concat));
+let x = b.str_lit("x");
+let value = b.call(concat, &[read, x]);
+let body = b.expr(Expr::Assign { target, op: None, value });
+let once = b.expr(Expr::LetPlace { binder: p, place, body });
+let fbody = b.block(&[], Some(once));
+let func = b.func(Name::new(names.intern("append")), &[pa], fbody);
+let root = b.module(None, &[func]);
 assert!(b.finish(root).is_ok());
 ```
 
@@ -1191,8 +1246,45 @@ assert!(b.finish(root).is_ok());
 `Ref { mutable, region: Option<PathId>, inner }`, `Ptr { mutable, inner }`,
 `Fn { params, ret, effects, throws, abi: Option<Symbol> }`, `Nullable(TyId)`,
 `Any` (gradual), `Object(List<Bound>)` (`dyn A + 'r`), `Impl(List<Bound>)`
-(opaque `impl A`), `Never`, `SelfTy`, `Err`. Every annotation slot in HIR is
-optional; dynamic languages create no types at all.
+(opaque `impl A`), `Union(List<TyId>)` (`int|string`), `Intersection(List<TyId>)`
+(`A&B`), `Never`, `SelfTy`, `Err`. Every annotation slot in HIR is optional;
+dynamic languages create no types at all. There is no `null` type: `T|null` is
+`Nullable(T)`.
+
+**Canonical form of unions and intersections** (spec §5.1): at least two
+members; no union directly in a union (nor a `Nullable`: write
+`Nullable(Union)`), no intersection directly in an intersection; members
+strictly sorted by their key (the type's token stream: tags, primitive kinds,
+path roots and segment names, list lengths; never resolutions), so no member
+repeats. Members containing an error form or a constant expression, or larger
+than 64 type/path nodes, have no key and may stand anywhere. `finish`
+normalizes; the validator checks. Normalization rewrites only tree-shaped
+parts: a union whose member list is out of range, or whose members have a
+second parent, is left as it is, so the validator still reports the lowering
+bug.
+
+```rust
+use hir_lang::{Builder, Name, Pat, Prim, Stmt, Ty};
+use intern_lang::Interner;
+
+// let _: str | i64 | i64;   becomes   i64 | str
+let mut names = Interner::new();
+let mut b = Builder::new();
+let s = b.ty(Ty::Prim(Prim::Str));
+let i = b.ty(Ty::Prim(Prim::I64));
+let again = b.ty(Ty::Prim(Prim::I64));
+let members = b.list(&[s, i, again]);
+let union = b.ty(Ty::Union(members));
+let pat = b.pat(Pat::Wild);
+let decl = b.stmt(Stmt::Let { pat, ty: Some(union), init: None, else_: None });
+let body = b.block(&[decl], None);
+let f = b.func(Name::new(names.intern("f")), &[], body);
+let root = b.module(None, &[f]);
+let hir = b.finish(root)?;
+let Ty::Union(sorted) = *hir.ty(union) else { unreachable!() };
+assert_eq!(hir.list(sorted), [i, s]);
+# Ok::<(), hir_lang::HirError>(())
+```
 
 ### `Bound`
 
@@ -1231,8 +1323,8 @@ pub struct Binder { pub name: Name, pub kind: BinderKind, pub mutable: bool }
 ```
 
 `Binder::new(name, kind)`, `with_mutable(bool)`.
-`BinderKind = Local | Param | Capture | TypeParam | ConstParam | Region | Label`,
-with `is_value()` (`Local`, `Param`, `Capture`), `is_type_level()`
+`BinderKind = Local | Param | Capture | TypeParam | ConstParam | Region | Label | Place`,
+with `is_value()` (`Local`, `Param`, `Capture`, `Place`), `is_type_level()`
 (`TypeParam`, `ConstParam`, `Region`), `ns()` (the namespace a binder of that
 kind is referenced in; `None` for labels), and `name()`.
 
@@ -1280,7 +1372,7 @@ for a full resolution, per namespace:
 
 | `ns` | `Local` kinds | this unit's `Def` items | `Def` variants | other units | `Prim` | `Extern` |
 |---|---|---|---|---|---|---|
-| `Value` | `Local` `Param` `Capture` `ConstParam` | `Fn` `Const` `Global` `Record` `Class` `Err` | yes | yes | no | yes |
+| `Value` | `Local` `Param` `Capture` `Place` `ConstParam` | `Fn` `Const` `Global` `Record` `Class` `Err` | yes | yes | no | yes |
 | `Type` | `TypeParam` | `Record` `Sum` `Class` `Interface` `Alias` `AssocType` `Err` | yes | yes | yes | yes |
 | `Pattern` | none | `Const` `Record` `Class` `Err` | yes | yes | no | yes |
 | `Region` | `Region` | none | no | no | no | no |
@@ -1363,17 +1455,24 @@ pub const fn promotes(self) -> bool             // overflow policy is `promote`
 
 ### `OpKind`
 
-Every operation of `specs/OPS.md` §3–§5: `Add Sub Mul Neg Abs Div FloorDiv Rem
-FloorMod And Or Xor Not Shl Shr Eq Ne Lt Le Gt Ge Min Max IeeeRem Sqrt Fma Floor
-Ceil Trunc Round RoundEven TotalCmp`, and the conversions `IntCast(Prim)
+Every operation of `specs/OPS.md` (v2) §3–§5: `Add Sub Mul Neg Abs Div FloorDiv
+Rem FloorMod And Or Xor Not BitNot Shl Shr Pow Eq Ne Lt Le Gt Ge Min Max IeeeRem
+Sqrt Fma Floor Ceil Trunc Round RoundEven TotalCmp`, and the conversions `IntCast(Prim)
 FloatToInt(Prim) Zext(Prim) Sext(Prim) Narrow(Prim) IntToFloat(Prim)
 Bitcast(Prim) BoolToInt(Prim) F32ToF64 F64ToF32 CharFromU32`. `Narrow` is OPS's
 integer `trunc` conversion. Methods: `name()` (OPS spelling), `arity()`,
 `target()`, `default_policy()`.
 
+OPS's `not` is split: `Not` (`not`) is **logical** negation (bool; on dynamic
+values the negation of truthiness, LSB `dlnot`), `BitNot` (`bit_not`) the
+**bitwise** complement of an integer (LSB `dnot`). `Pow` (`pow`, OPS v2)
+consults `overflow`: integer powers are exact or follow it, a negative
+exponent is `NegativeExponent` unless the policy is `promote` (which gives the
+`f64` power); float `pow` ignores the policy.
+
 | Ops | Policy fields |
 |---|---|
-| `add sub mul neg abs int_cast` | `overflow` |
+| `add sub mul neg abs pow int_cast` | `overflow` |
 | `div floor_div` | `overflow`, `div_zero` |
 | `rem floor_mod` | `div_zero` |
 | `shl shr` | `shift` |
@@ -1389,7 +1488,9 @@ pub struct Policy { pub overflow: Option<Overflow>, pub div_zero: Option<DivZero
 
 `Policy::NONE`, `Policy::CAST` (what a cast carries), and `with_*` setters.
 `Overflow = Error | Wrap | Trap | Promote`, `DivZero = Error | Trap`,
-`Shift = Error | Mask`, `FloatToInt = Error | Saturate`.
+`Shift = Error | Mask | Saturate` (`Saturate`: PHP shifts, OPS v2: an amount at
+or above the width gives `0`, or `-1` for `shr` of a negative value; a negative
+amount is still an error), `FloatToInt = Error | Saturate`.
 
 `Overflow::Promote` (OPS §2, Mox/PHP): when the exact integer result is not
 representable, the result is the `f64` nearest the exact mathematical result;
@@ -1519,7 +1620,9 @@ Binders print as `name%id`, marks as `'eN`, resolutions as `→ local x%3`,
 `→ item 4`, `→ variant 2`, `→ item u7:3` (another unit), `→ prim i32`,
 `→ extern name`, with ` +N` for unresolved segments. Non-node children
 appear as groups (`(arm …)`, `(guard …)`, `(arg name …)`, `(arg place …)`,
-`(capture x%2 by-value …)`, `(binding …)`, `(operand …)`, `(rule …)`).
+`(capture x%2 by-value …)`, `(binding …)`, `(operand …)`, `(rule …)`,
+`(key …)` for a yield's key). 0.4 headers: `union`, `intersection`,
+`let-place p%N`, `yield-from`, `op bit_not`, `op pow`, `shift=saturate`.
 Indentation stops growing after 64 levels, so the output is linear in the node
 count at any depth. The output is identical on every platform.
 
@@ -1560,7 +1663,7 @@ it is about, when there is one.
 | `ExpansionOrder { expn }` | an expansion refers to itself or a later one | record parents first |
 | `RootNotModule` | the root is not a module | |
 | `SharedNode { node }` | a node has two parents (or is its own ancestor) | build a fresh node per use, or `copy_subtree` |
-| `Unreachable { node }` | a live node is not in the tree | attach or drop it |
+| `Unreachable { node }` | a node is not in the tree; for an orphaned subtree, its top (for an orphaned cycle, its first node) | attach or drop it |
 | `Malformed { site, problem: Malformed }` | a node's own shape is wrong | see below |
 | `DuplicateName { node, name, index }` | two members of one list share a name; `index` is the first repetition in list order | |
 | `Policy { expr }` | an op/cast/compound assignment lacks or has extra policy fields | use `Op::new` defaults |
@@ -1575,7 +1678,7 @@ it is about, when there is one.
 | `OutOfScope { path, binder }` | binder not in scope at the path | |
 | `NotCapturable { path, binder }` | binder behind a nested item, a constant context, a non-capturing closure, or a once-evaluated default | |
 | `Jump { expr, problem: JumpProblem }` | `BreakOutsideLoop`, `ContinueOutsideLoop`, `LabelNotInScope`, `ContinueToBlock`, `OutOfDefer`, `ContinueInStep` | |
-| `Effect { expr, problem: EffectProblem }` | `ReturnOutsideFunction`, `AwaitOutsideAsync`, `YieldOutsideGenerator`, `ThrowNotAllowed`, `YieldInCleanup` | declare the effect, wrap in `try`, or move the `yield` |
+| `Effect { expr, problem: EffectProblem }` | `ReturnOutsideFunction`, `AwaitOutsideAsync`, `YieldOutsideGenerator`, `ThrowNotAllowed` | declare the effect or wrap in `try` |
 
 ### `Malformed`
 
@@ -1587,6 +1690,7 @@ it is about, when there is one.
 `ItemPlacement`, `ReceiverPlacement`, `ParamOrder`, `ParamDefault`,
 `InferCapture`, `EmptyAttrArg`, `AttrOrder`, `PromoteOnStaticResult`,
 `PathShape`, `RangeBound`, `NegativeZero`, `AsmTemplate`, `AsmOperand`,
+`TypeArity`, `TypeNesting`, `TypeOrder`, `YieldKey`,
 `IntrinsicArity`, `MemOrder`, `PlaceArg`, `AppendContext`, `OrPatternModes`.
 
 ### `Site`, `Capacity`, `JumpProblem`, `EffectProblem`
@@ -1610,6 +1714,16 @@ assert!(matches!(err, HirError::Malformed { problem: Malformed::EmptyPath, .. })
 assert_eq!(err.to_string(), "path 0: a path has no segments");
 ```
 
+### Runtime errors defined by HIR
+
+Not Rust types: the run-time error kinds HIR's own forms raise, for bcgen-lang
+and the T0 evaluator (spec §8.10). HIR owns codes E0200–E0299 (OPS owns
+E0001–E0099, LSB E0100–E0199).
+
+| Code | Kind | Raised by |
+|---|---|---|
+| E0200 | `NoMatch` | a `match` none of whose arms matches (Mox maps it to `UnhandledMatchError`) |
+
 ## Re-exports
 
 | Item | From | Why |
@@ -1629,12 +1743,14 @@ assert_eq!(err.to_string(), "path 0: a path has no segments");
 |---|---|---|
 | Entries per arena, pool, or the text pool | `u32::MAX - 1` | `CapacityExceeded` |
 | Total nodes across arenas | `u32::MAX - 1` | `CapacityExceeded { what: Total }` |
-| Lenient repair rounds | 16; past that, a last resort empties the root module (every other node becomes a dead error node) so the result is still valid | — |
+| Lenient repair rounds | 2 (spec §13.2; checked by a debug assertion); a hard limit proportional to the arena sizes turns a broken argument into an error instead of a hang | — |
+| Nodes in a union member's key | 64 (larger members are unkeyed, exempt from ordering) | — |
 | Nesting depth | none (every algorithm is iterative) | — |
 
 ## Stability
 
-Pre-1.0; 0.3 broke 0.2 (see the CHANGELOG for the migration list). The node
+Pre-1.0; 0.4 broke 0.3 and 0.3 broke 0.2 (see the CHANGELOG for the migration
+lists). The node
 forms are deliberately **not** `#[non_exhaustive]`: every consumer must handle
 every form, and a new form is a breaking change for all of them regardless.
 `Intrinsic`, `Event`, `Frame`, the error enums, and `PrintOptions` are

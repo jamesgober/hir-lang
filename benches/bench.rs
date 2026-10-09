@@ -194,5 +194,84 @@ fn deep(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, scales, deep);
+/// Union types: `finish` normalizes (sorts) every union, then validates its
+/// canonical form. Each `let _: S | B | str | i64;` is built out of order.
+/// The nested case is a 100,000-deep `[(...) | i64] | i64` chain: keys are
+/// budgeted per member, so normalization and validation stay linear.
+fn unions(c: &mut Criterion) {
+    let flat = || {
+        let mut names = Interner::new();
+        let (s, bn) = (names.intern("S"), names.intern("B"));
+        let mut b = Builder::new();
+        let mut funcs = Vec::new();
+        for f in 0..1_000 {
+            let mut stmts = Vec::new();
+            for _ in 0..100 {
+                let ps = b.name_path(Name::new(s), hir_lang::Ns::Type);
+                let pb = b.name_path(Name::new(bn), hir_lang::Ns::Type);
+                let members = [
+                    b.ty(hir_lang::Ty::Path(ps)),
+                    b.ty(hir_lang::Ty::Path(pb)),
+                    b.ty(hir_lang::Ty::Prim(hir_lang::Prim::Str)),
+                    b.ty(hir_lang::Ty::Prim(hir_lang::Prim::I64)),
+                ];
+                let list = b.list(&members);
+                let union = b.ty(hir_lang::Ty::Union(list));
+                let pat = b.pat(Pat::Wild);
+                stmts.push(b.stmt(hir_lang::Stmt::Let {
+                    pat,
+                    ty: Some(union),
+                    init: None,
+                    else_: None,
+                }));
+            }
+            let body = b.block(&stmts, None);
+            funcs.push(b.func(Name::new(names.intern(&format!("f{f}"))), &[], body));
+        }
+        let root = b.module(None, &funcs);
+        (b, root)
+    };
+    let nested = || {
+        let mut names = Interner::new();
+        let mut b = Builder::new();
+        let mut t = b.ty(hir_lang::Ty::Prim(hir_lang::Prim::I64));
+        for _ in 0..100_000 {
+            let slice = b.ty(hir_lang::Ty::Slice(t));
+            let int = b.ty(hir_lang::Ty::Prim(hir_lang::Prim::I64));
+            let list = b.list(&[slice, int]);
+            t = b.ty(hir_lang::Ty::Union(list));
+        }
+        let pat = b.pat(Pat::Wild);
+        let stmt = b.stmt(hir_lang::Stmt::Let {
+            pat,
+            ty: Some(t),
+            init: None,
+            else_: None,
+        });
+        let body = b.block(&[stmt], None);
+        let f = b.func(Name::new(names.intern("nested")), &[], body);
+        let root = b.module(None, &[f]);
+        (b, root)
+    };
+    let mut group = c.benchmark_group("unions");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(100_000));
+    group.bench_function("finish_100k_flat", |bench| {
+        bench.iter_batched(
+            flat,
+            |(b, root)| black_box(b.finish(root).expect("canonical")),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function("finish_100k_nested", |bench| {
+        bench.iter_batched(
+            nested,
+            |(b, root)| black_box(b.finish(root).expect("canonical")),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(benches, scales, deep, unions);
 criterion_main!(benches);

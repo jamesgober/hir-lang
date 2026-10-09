@@ -451,7 +451,10 @@ pub enum Expr {
         policy: Policy,
     },
     /// `target = value` or `target op= value`; `target` is a place expression and
-    /// is evaluated once.
+    /// is evaluated once. Evaluates to the value written to the place (after
+    /// any conversion the store performs), so `a = b = 3` assigns 3 to both.
+    /// A compound operator is an OPS op; any other operator (concatenation,
+    /// a host function, a template) uses [`Expr::LetPlace`].
     Assign {
         /// The place.
         target: ExprId,
@@ -460,8 +463,24 @@ pub enum Expr {
         /// The assigned value.
         value: ExprId,
     },
+    /// `let_place binder = place in body`: evaluate the operands of the place
+    /// expression `place` (its base, index, member name) **once**, and make
+    /// `binder` (kind [`Place`](crate::BinderKind::Place)) name that place in
+    /// `body`, for reads and writes. Evaluates to `body`. This is how a
+    /// compound assignment with a non-OPS operator (`$a[f()] .= "x"`), `??=`,
+    /// and `++`/`--` evaluate their place exactly once. The binder is visible
+    /// only in `body` and never across a frame (no closure may capture it).
+    LetPlace {
+        /// The place alias.
+        binder: BinderId,
+        /// The place expression whose operands are evaluated once.
+        place: ExprId,
+        /// The body, where `binder` names the place.
+        body: ExprId,
+    },
     /// `target = &source`: make the place `target` an alias of the place
-    /// `source` (PHP reference assignment).
+    /// `source` (PHP reference assignment). Evaluates to the value of the
+    /// aliased place.
     RefAssign {
         /// The place that becomes an alias.
         target: ExprId,
@@ -529,13 +548,26 @@ pub enum Expr {
         body: ExprId,
         /// Catch clauses, tried in order.
         catches: List<Arm>,
-        /// Runs on every exit; follows the `defer` rules.
+        /// Runs on every exit. Unlike a `defer` body, a jump may leave it
+        /// (overriding the pending completion); it may suspend (LSB rule 12).
         finally: Option<ExprId>,
     },
     /// Suspend until an awaitable completes.
     Await(ExprId),
-    /// Yield from a generator; evaluates to the resumption value.
-    Yield(Option<ExprId>),
+    /// Yield from a generator; evaluates to the value sent on resumption.
+    /// Without `value`, yields null (and `key` must be absent too); without
+    /// `key`, the runtime supplies the language's automatic key (PHP: one more
+    /// than the largest integer key so far).
+    Yield {
+        /// The explicit key (`yield $k => $v`).
+        key: Option<ExprId>,
+        /// The yielded value.
+        value: Option<ExprId>,
+    },
+    /// Delegate to an inner generator or iterable (`yield from`): every value
+    /// it yields is yielded with its key, sent values and thrown errors are
+    /// forwarded to it, and the expression evaluates to its return value.
+    YieldFrom(ExprId),
     /// Start a task running a zero-parameter callable; evaluates to a handle.
     Spawn(ExprId),
     /// Inline assembly.

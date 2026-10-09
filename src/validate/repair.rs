@@ -2,34 +2,62 @@
 //!
 //! A repair replaces an offending node with its kind's error form (or makes a
 //! narrower fix: an error resolution, a wildcard pattern, a corrected binder
-//! kind). Repairs only ever remove structure, so each round strictly shrinks
-//! what can be wrong; consequences of a repair (children left dead, binders
-//! left unbound) are fixed silently. Problems are reported once: those found
-//! by the first scan and the first walk, in source order.
+//! kind, a root mark). Each round also removes the **consequences of its own
+//! repairs** before the next pass: nodes that the repairs made unreachable
+//! become error nodes, and resolutions naming a binder whose binding site
+//! disappeared (or whose kind a repair changed) become `Res::Err`. Those
+//! consequences are fixed without a report; every problem a pass finds is
+//! reported.
+//!
+//! **At most two repair rounds** (spec §13.2): one for the node-local scan
+//! and one for the tree walk. The argument:
+//!
+//! - *Scan, then rescan.* A scan problem is a property of one node, repaired
+//!   by changing that node (error form, root mark, dropped attribute entry).
+//!   Error forms pass every scan check, and every scan check that looks at a
+//!   child accepts the child's error form (`Expr::Err` is a place, `Pat::Err`
+//!   a range bound, an error path a path, and members with error forms are
+//!   exempt from union ordering). So the rescan finds nothing.
+//! - *Walk, then rewalk.* A walk problem is repaired at the node it names
+//!   (or the parent of a shared node), and all its consequences are removed
+//!   in the same round: what became unreachable is an error node, and every
+//!   reference to a binder that lost its site or changed kind is `Res::Err`.
+//!   A repair never changes what a surviving node may see: frames, loops,
+//!   `try` bodies and effects come from ancestors, which survive, and binder
+//!   scopes come from binding sites, which either survive unchanged or are
+//!   gone (their references then repaired). Every problem a construct has
+//!   is reported in the same pass (all repeats of a binding, every
+//!   or-pattern alternative, every unreachable node, every out-of-scope
+//!   path), and a second binding site is reported as such without touching
+//!   the binder's kind. So the rewalk finds nothing, and since walk repairs
+//!   only produce error forms, `Res::Err` and wildcards, nothing new for the
+//!   scan either.
+//!
+//! The debug assertion on the round count is exercised by the lenient
+//! property tests. Independently of the argument, the loop terminates:
+//! every round strictly reduces the number of non-error nodes, non-`Err`
+//! resolutions, non-root marks and attribute entries, except kind changes,
+//! which happen at most once per binder; the hard limit below turns a
+//! broken argument into an error instead of a hang.
 
-use alloc::{collections::BTreeSet, vec::Vec};
+use alloc::vec::Vec;
 
-use super::{
-    Ctx, Index, Repair, Sink, preflight, scan,
-    tree::{self, Cascades},
-};
+use super::{Ctx, Index, Repair, Sink, preflight, scan, tree};
 use crate::{
     error::HirError,
     expr::{Expr, Stmt},
-    id::{ExprId, ItemId, List, NodeRef, PatId},
+    id::{BinderId, ItemId, List, NodeRef, PatId},
     item::{FieldDef, Item, ItemKind, Param, Shape, Variant},
     name::{Path, PathRoot, Res},
     origin::{ExpnId, Origin},
     pat::Pat,
     store::Store,
     ty::{Effects, Ty},
-    walk::{Step, expand},
+    walk::{Step, direct_binders, expand},
 };
 
-/// Rounds after which every node but the root is turned into an error node,
-/// which is valid by construction. Real inputs settle in at most three rounds
-/// (problems, their dead children, then their unbound references).
-const MAX_ROUNDS: usize = 16;
+/// The rounds the argument above allows; checked in debug builds.
+const PROVEN_ROUNDS: usize = 2;
 
 /// Validates leniently, repairing `store` in place. Returns the index of the
 /// repaired store and the problems found, in source order.
@@ -42,35 +70,190 @@ pub(crate) fn validate_lenient(
 ) -> Result<(Index, Vec<HirError>), HirError> {
     preflight(store, root)?;
     let mut reported: Vec<(HirError, Origin, usize)> = Vec::new();
-    let mut cascades = Cascades::default();
-    let mut scanned = false;
-    let mut walked = false;
-    for _ in 0..MAX_ROUNDS {
+    // A bound on the rounds that does not depend on the argument: each round
+    // removes at least one unit of the measure, which is at most this.
+    let limit = store
+        .items
+        .len()
+        .saturating_add(store.exprs.len())
+        .saturating_add(store.stmts.len())
+        .saturating_add(store.pats.len())
+        .saturating_add(store.tys.len())
+        .saturating_add(store.paths.len().saturating_mul(2))
+        .saturating_add(store.fields.len())
+        .saturating_add(store.variants.len())
+        .saturating_add(store.params.len())
+        .saturating_add(store.binders.len().saturating_mul(3))
+        .saturating_add(store.expansions.len())
+        .saturating_add(store.attrs.len())
+        .saturating_add(2);
+    let mut rounds = 0usize;
+    loop {
         let mut sink = Sink::lenient();
         scan::scan(store, root, ctx, &mut sink)?;
-        if !sink.problems.is_empty() {
-            if !scanned {
-                collect(store, &sink, &mut reported);
-            }
-            scanned = true;
-            apply(store, root, &sink, &mut cascades);
-            continue;
-        }
-        scanned = true;
-        let mut sink = Sink::lenient();
-        cascades.quiet = walked;
-        let index = tree::walk(store, root, ctx, &mut sink, &cascades)?;
         if sink.problems.is_empty() {
-            return Ok((index, finish(reported)));
+            sink = Sink::lenient();
+            let index = tree::walk(store, root, ctx, &mut sink)?;
+            if sink.problems.is_empty() {
+                debug_assert!(
+                    rounds <= PROVEN_ROUNDS,
+                    "lenient repair took {rounds} rounds"
+                );
+                return Ok((index, finish(reported)));
+            }
+        }
+        rounds += 1;
+        if rounds > limit {
+            // Only reachable if the termination argument is wrong.
+            let first = sink.problems.first().map(|(e, _, _)| *e);
+            return Err(first.unwrap_or(HirError::RootNotModule));
         }
         collect(store, &sink, &mut reported);
-        walked = true;
-        apply(store, root, &sink, &mut cascades);
+        round(store, root, &sink);
     }
-    fallback(store, root);
-    let mut sink = Sink::strict();
-    let index = tree::walk(store, root, ctx, &mut sink, &Cascades::default())?;
-    Ok((index, finish(reported)))
+}
+
+/// One repair round: apply the repairs, then remove their consequences.
+fn round(store: &mut Store, root: ItemId, sink: &Sink) {
+    let before = Live::of(store, root);
+    let changed_kind = apply(store, root, sink);
+    let after = Live::of(store, root);
+    // Nodes the repairs cut off become error nodes.
+    for node in before.nodes_not_in(&after) {
+        if !is_dead_ok(store, node) {
+            errify(store, root, node);
+        }
+    }
+    // References to binders that lost their site or changed kind.
+    for (i, path) in store.paths.nodes.iter_mut().enumerate() {
+        let Res::Local(b) = path.res else { continue };
+        let live = after.path(i);
+        let lost = before.binds(b) && !after.binds(b);
+        let changed = changed_kind.get(b.index()).copied().unwrap_or(false);
+        if live && (lost || changed) {
+            path.res = Res::Err;
+            path.unresolved = 0;
+        }
+    }
+}
+
+/// The nodes reachable from the root, and the binders bound by them.
+struct Live {
+    nodes: [Vec<bool>; 9],
+    bound: Vec<bool>,
+}
+
+impl Live {
+    fn of(store: &Store, root: ItemId) -> Self {
+        let mut live = Self {
+            nodes: [
+                alloc::vec![false; store.items.len()],
+                alloc::vec![false; store.exprs.len()],
+                alloc::vec![false; store.stmts.len()],
+                alloc::vec![false; store.pats.len()],
+                alloc::vec![false; store.tys.len()],
+                alloc::vec![false; store.paths.len()],
+                alloc::vec![false; store.fields.len()],
+                alloc::vec![false; store.variants.len()],
+                alloc::vec![false; store.params.len()],
+            ],
+            bound: alloc::vec![false; store.binders.len()],
+        };
+        let mut stack = alloc::vec![NodeRef::Item(root)];
+        let mut steps = Vec::new();
+        while let Some(node) = stack.pop() {
+            let Some(seen) = live
+                .nodes
+                .get_mut(slot(node))
+                .and_then(|v| v.get_mut(node.index()))
+            else {
+                continue;
+            };
+            if *seen {
+                continue;
+            }
+            *seen = true;
+            direct_binders(store, node, |b| {
+                if let Some(x) = live.bound.get_mut(b.index()) {
+                    *x = true;
+                }
+            });
+            steps.clear();
+            expand(store, node, &mut steps);
+            for step in &steps {
+                if let Step::Enter(child) = step {
+                    stack.push(*child);
+                }
+            }
+        }
+        live
+    }
+
+    fn contains(&self, node: NodeRef) -> bool {
+        self.nodes
+            .get(slot(node))
+            .and_then(|v| v.get(node.index()))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn path(&self, i: usize) -> bool {
+        self.nodes
+            .get(5)
+            .and_then(|v| v.get(i))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn binds(&self, b: BinderId) -> bool {
+        self.bound.get(b.index()).copied().unwrap_or(false)
+    }
+
+    /// The nodes live in `self` but not in `other`, in arena order.
+    fn nodes_not_in(&self, other: &Self) -> Vec<NodeRef> {
+        let mut out = Vec::new();
+        for (k, v) in self.nodes.iter().enumerate() {
+            for (i, live) in v.iter().enumerate() {
+                if !*live {
+                    continue;
+                }
+                let node = node_at(k, i);
+                if !other.contains(node) {
+                    out.push(node);
+                }
+            }
+        }
+        out
+    }
+}
+
+fn slot(node: NodeRef) -> usize {
+    match node {
+        NodeRef::Item(_) => 0,
+        NodeRef::Expr(_) => 1,
+        NodeRef::Stmt(_) => 2,
+        NodeRef::Pat(_) => 3,
+        NodeRef::Ty(_) => 4,
+        NodeRef::Path(_) => 5,
+        NodeRef::Field(_) => 6,
+        NodeRef::Variant(_) => 7,
+        NodeRef::Param(_) => 8,
+    }
+}
+
+fn node_at(slot: usize, i: usize) -> NodeRef {
+    let i = u32::try_from(i).unwrap_or(u32::MAX - 1);
+    match slot {
+        0 => NodeRef::Item(ItemId::from_raw_index(i)),
+        1 => NodeRef::Expr(crate::id::ExprId::from_raw_index(i)),
+        2 => NodeRef::Stmt(crate::id::StmtId::from_raw_index(i)),
+        3 => NodeRef::Pat(PatId::from_raw_index(i)),
+        4 => NodeRef::Ty(crate::id::TyId::from_raw_index(i)),
+        5 => NodeRef::Path(crate::id::PathId::from_raw_index(i)),
+        6 => NodeRef::Field(crate::id::FieldId::from_raw_index(i)),
+        7 => NodeRef::Variant(crate::id::VariantId::from_raw_index(i)),
+        _ => NodeRef::Param(crate::id::ParamId::from_raw_index(i)),
+    }
 }
 
 /// Keeps the problems to report, with their origins for sorting.
@@ -90,14 +273,13 @@ fn finish(mut reported: Vec<(HirError, Origin, usize)>) -> Vec<HirError> {
     reported.into_iter().map(|(e, _, _)| e).collect()
 }
 
-fn apply(store: &mut Store, root: ItemId, sink: &Sink, cascades: &mut Cascades) {
-    let mut drop_attrs: BTreeSet<usize> = BTreeSet::new();
+/// Applies a round's repairs. Returns which binders changed kind.
+fn apply(store: &mut Store, root: ItemId, sink: &Sink) -> Vec<bool> {
+    let mut changed_kind = alloc::vec![false; store.binders.len()];
+    let mut drop_attrs: Vec<usize> = Vec::new();
     for (_, repair, _) in &sink.problems {
         match *repair {
-            Repair::ErrNode(node) => {
-                note_cascades(store, node, cascades);
-                errify(store, root, node);
-            }
+            Repair::ErrNode(node) => errify(store, root, node),
             Repair::ResErr { path, ns } => {
                 if let Some(p) = store.paths.nodes.get_mut(path.index()) {
                     p.res = Res::Err;
@@ -108,14 +290,18 @@ fn apply(store: &mut Store, root: ItemId, sink: &Sink, cascades: &mut Cascades) 
                 }
             }
             Repair::WildPat(pat) => {
-                note_cascades(store, NodeRef::Pat(pat), cascades);
                 if let Some(p) = store.pats.nodes.get_mut(pat.index()) {
                     *p = Pat::Wild;
                 }
             }
             Repair::SetKind(b, kind) => {
                 if let Some(binder) = store.binders.nodes.get_mut(b.index()) {
-                    binder.kind = kind;
+                    if binder.kind != kind {
+                        binder.kind = kind;
+                        if let Some(c) = changed_kind.get_mut(b.index()) {
+                            *c = true;
+                        }
+                    }
                 }
             }
             Repair::BinderMarkRoot(b) => {
@@ -139,16 +325,17 @@ fn apply(store: &mut Store, root: ItemId, sink: &Sink, cascades: &mut Cascades) 
                     e.def_site = ExpnId::ROOT;
                 }
             }
-            Repair::DropAttr(i) => {
-                let _ = drop_attrs.insert(i);
-            }
+            Repair::DropAttr(i) => drop_attrs.push(i),
         }
     }
+    drop_attrs.sort_unstable();
+    drop_attrs.dedup();
     for i in drop_attrs.into_iter().rev() {
         if i < store.attrs.len() {
             let _ = store.attrs.remove(i);
         }
     }
+    changed_kind
 }
 
 fn origin_mut(store: &mut Store, node: NodeRef) -> Option<&mut Origin> {
@@ -163,89 +350,6 @@ fn origin_mut(store: &mut Store, node: NodeRef) -> Option<&mut Origin> {
         NodeRef::Field(_) => store.fields.origins.get_mut(i),
         NodeRef::Variant(_) => store.variants.origins.get_mut(i),
         NodeRef::Param(_) => store.params.origins.get_mut(i),
-    }
-}
-
-/// Records what repairing `node` leaves behind: its descendants become dead
-/// and the binders bound inside lose their site. Each node is visited once
-/// across all repairs of a round, so nested repairs stay linear.
-fn note_cascades(store: &Store, node: NodeRef, cascades: &mut Cascades) {
-    let mut stack = Vec::new();
-    let mut steps = Vec::new();
-    steps.clear();
-    expand(store, node, &mut steps);
-    for s in &steps {
-        if let Step::Enter(child) = s {
-            stack.push(*child);
-        }
-    }
-    note_binders(store, node, cascades);
-    while let Some(n) = stack.pop() {
-        if !cascades.dead.insert(n) {
-            continue;
-        }
-        note_binders(store, n, cascades);
-        steps.clear();
-        expand(store, n, &mut steps);
-        for s in &steps {
-            if let Step::Enter(child) = s {
-                stack.push(*child);
-            }
-        }
-    }
-}
-
-/// Notes the binders a node binds directly.
-fn note_binders(store: &Store, node: NodeRef, cascades: &mut Cascades) {
-    let mut add = |b| {
-        let _ = cascades.lost.insert(b);
-    };
-    match node {
-        NodeRef::Pat(p) => {
-            if let Some(Pat::Bind { binder, .. } | Pat::Ident { binder, .. }) = store.pat(p) {
-                add(*binder);
-            }
-        }
-        NodeRef::Expr(e) => match store.expr(e) {
-            Some(Expr::Closure(c)) => {
-                for cap in store.list(c.captures) {
-                    add(cap.binder);
-                }
-                if let Some(me) = c.self_binder {
-                    add(me);
-                }
-            }
-            Some(Expr::Loop { label: Some(l), .. }) => add(*l),
-            Some(Expr::Block(b)) => {
-                if let Some(l) = b.label {
-                    add(l);
-                }
-            }
-            _ => {}
-        },
-        NodeRef::Stmt(s) => {
-            if let Some(Stmt::Static { binder, .. } | Stmt::Global { binder, .. }) = store.stmt(s) {
-                add(*binder);
-            }
-        }
-        NodeRef::Item(i) => {
-            let generics = match store.item(i).map(|i| &i.kind) {
-                Some(ItemKind::Fn(f)) => Some(f.generics),
-                Some(ItemKind::Record(r)) => Some(r.generics),
-                Some(ItemKind::Sum(s)) => Some(s.generics),
-                Some(ItemKind::Class(c)) => Some(c.generics),
-                Some(ItemKind::Interface(x)) => Some(x.generics),
-                Some(ItemKind::Impl(x)) => Some(x.generics),
-                Some(ItemKind::Alias { generics, .. }) => Some(*generics),
-                _ => None,
-            };
-            if let Some(g) = generics {
-                for gp in store.list(g.params) {
-                    add(gp.binder);
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -370,48 +474,4 @@ pub(crate) fn is_dead_ok(store: &Store, node: NodeRef) -> bool {
             p.ty.is_none() && p.default.is_none() && matches!(store.pat(p.pat), Some(Pat::Err))
         }),
     }
-}
-
-/// The last resort: an empty root module and every other node an error form.
-/// Valid by construction (dead error nodes are allowed; binders may be
-/// unbound; expansions were already repaired by the scan rounds).
-fn fallback(store: &mut Store, root: ItemId) {
-    errify(store, root, NodeRef::Item(root));
-    let counts = [
-        store.items.len(),
-        store.exprs.len(),
-        store.stmts.len(),
-        store.pats.len(),
-        store.tys.len(),
-        store.paths.len(),
-        store.fields.len(),
-        store.variants.len(),
-        store.params.len(),
-    ];
-    for (slot, n) in counts.iter().enumerate() {
-        for i in 0..*n {
-            let i = u32::try_from(i).unwrap_or(0);
-            let node = match slot {
-                0 => NodeRef::Item(ItemId::from_raw_index(i)),
-                1 => NodeRef::Expr(ExprId::from_raw_index(i)),
-                2 => NodeRef::Stmt(crate::id::StmtId::from_raw_index(i)),
-                3 => NodeRef::Pat(PatId::from_raw_index(i)),
-                4 => NodeRef::Ty(crate::id::TyId::from_raw_index(i)),
-                5 => NodeRef::Path(crate::id::PathId::from_raw_index(i)),
-                6 => NodeRef::Field(crate::id::FieldId::from_raw_index(i)),
-                7 => NodeRef::Variant(crate::id::VariantId::from_raw_index(i)),
-                _ => NodeRef::Param(crate::id::ParamId::from_raw_index(i)),
-            };
-            if node != NodeRef::Item(root) && !is_dead_ok(store, node) {
-                errify(store, root, node);
-            }
-        }
-    }
-    for b in &mut store.binders.nodes {
-        b.name.mark = ExpnId::ROOT;
-    }
-    for o in &mut store.binders.origins {
-        o.expn = ExpnId::ROOT;
-    }
-    store.attrs.clear();
 }

@@ -477,6 +477,7 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
             let v = match s {
                 Shift::Error => "error",
                 Shift::Mask => "mask",
+                Shift::Saturate => "saturate",
             };
             write!(self.out, " shift={v}")?;
         }
@@ -846,7 +847,12 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
             Expr::Throw(_) => self.out.write_str("throw"),
             Expr::Try { .. } => self.out.write_str("try"),
             Expr::Await(_) => self.out.write_str("await"),
-            Expr::Yield(_) => self.out.write_str("yield"),
+            Expr::Yield { .. } => self.out.write_str("yield"),
+            Expr::YieldFrom(_) => self.out.write_str("yield-from"),
+            Expr::LetPlace { binder, .. } => {
+                self.out.write_str("let-place ")?;
+                self.binder(binder)
+            }
             Expr::Spawn(_) => self.out.write_str("spawn"),
             Expr::Err => self.out.write_str("error"),
         }
@@ -927,6 +933,8 @@ impl<L: Lookup, W: Write> Printer<'_, L, W> {
             Ty::Never => self.out.write_str("never"),
             Ty::SelfTy => self.out.write_str("self-type"),
             Ty::Impl(_) => self.out.write_str("impl"),
+            Ty::Union(_) => self.out.write_str("union"),
+            Ty::Intersection(_) => self.out.write_str("intersection"),
             Ty::Err => self.out.write_str("error"),
         }
     }
