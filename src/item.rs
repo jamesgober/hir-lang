@@ -349,7 +349,7 @@ pub struct RecordDef {
     pub shape: Shape,
     /// The fields.
     pub fields: List<FieldId>,
-    /// An untagged union: the fields overlap (Zero, Kraken); shape `Named`.
+    /// An untagged union: the fields overlap (Zero, C); shape `Named`.
     pub is_union: bool,
 }
 

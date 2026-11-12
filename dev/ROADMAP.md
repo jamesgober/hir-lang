@@ -94,7 +94,7 @@ Status of every finding (fixed / fixed differently / deferred):
 | H7 | Bare identifier patterns | **Fixed.** `Pat::Ident { binder, path }`. |
 | H8 | No top-level code | **Fixed.** `Module { items, body, effects }`. |
 | M1 | Accessor inconsistency | **Fixed.** `get_*` accessors; `param` total like `path`/`field`; debug-assert on foreign ids. `variant`/`binder`/`expansion` stay `Option`-only (no error form to return). |
-| M2 | Body graph for NLL | **Designed (spec §19.2); implementation scheduled for 0.5** as already planned (coordinator decision). |
+| M2 | Body graph for NLL | **Designed (spec §19.2); implementation scheduled for 0.5** as already planned. |
 | M3 | Unions, ABI, atomics, asm, escape hatch | **Fixed.** `RecordDef.is_union`, `Ty::Fn.abi`, `Intrinsic` (atomics/fence/volatile with C++20 ordering checks, `Named`), structured `Expr::Asm`. |
 | M4 | Generic-arg gaps | **Fixed.** `GenericArg::{Binding, Constraint, Region, Const}`, `Bound::Region`, `Ty::Impl`, constant paths as range bounds. |
 | M5 | Default frames, visibility policy | **Fixed.** `Frame::Default` with `DefaultEval::{PerCall, Once}`; visibility recorded, enforcement is a resolve-lang policy (spec §10). |
