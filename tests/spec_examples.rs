@@ -27,9 +27,9 @@ fn check(hir: &hir_lang::Hir, names: &intern_lang::Interner, expected: &str) {
     }
 }
 
-/// §9.1 Kraken `match` on a sum.
+/// §9.1 `match` on a sum in a static language.
 #[test]
-fn test_spec_example_kraken_match() {
+fn test_spec_example_static_match() {
     let mut k = Kit::new();
     let f64_ty = k.b.ty(Ty::Prim(Prim::F64));
     let radius = k.b.field(hir_lang::FieldDef {
@@ -132,10 +132,10 @@ fn test_spec_example_kraken_match() {
     let area = k.func_fx("area", &[ps], Effects::NONE, body);
     let root = k.b.module(None, &[shape, area]);
     let hir = k.b.finish(root).unwrap();
-    check(&hir, &k.names, KRAKEN);
+    check(&hir, &k.names, STATIC_MATCH);
 }
 
-const KRAKEN: &str = r#"(module
+const STATIC_MATCH: &str = r#"(module
   (sum Shape
     (variant Circle tuple
       (field
