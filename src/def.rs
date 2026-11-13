@@ -14,7 +14,7 @@ use core::{
 
 use crate::id::{ItemId, VariantId};
 
-/// A compilation unit's identity, assigned by the host (the LexerSketch
+/// A compilation unit's identity, assigned by the host (the toolchain
 /// engine numbers the files of a session).
 ///
 /// The id must be unique among the units whose definitions refer to each

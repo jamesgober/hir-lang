@@ -1,6 +1,6 @@
 //! The lowering examples of `specs/HIR.md` §9, built through the builder,
 //! validated, and printed. Each expected text is the spec's example verbatim;
-//! when the LexerSketch plan is checked out next to this crate, the test also
+//! when the `HIR_SPEC` environment variable names the spec file, the test also
 //! confirms the spec still contains it, so the spec cannot drift from what the
 //! validator accepts.
 
@@ -18,7 +18,9 @@ fn check(hir: &hir_lang::Hir, names: &intern_lang::Interner, expected: &str) {
     assert_eq!(hir.validate(), Ok(()));
     let text = hir_lang::print(hir, names);
     assert_eq!(text, expected);
-    let spec = concat!(env!("CARGO_MANIFEST_DIR"), "/../_lexersketch/specs/HIR.md");
+    let Ok(spec) = std::env::var("HIR_SPEC") else {
+        return;
+    };
     if let Ok(spec) = std::fs::read_to_string(spec) {
         assert!(
             spec.replace("\r\n", "\n").contains(expected),

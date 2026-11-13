@@ -185,7 +185,7 @@ now built, validated, and printed by a test that checks the spec verbatim.
 
 ## [0.2.0] - 2026-10-08
 
-The foundation: the HIR data model of the LexerSketch spec (`specs/HIR.md`
+The foundation: the HIR data model of the toolchain's spec (`specs/HIR.md`
 §1–§17), with dense arena storage, a builder that captures origins, a total
 validator, iterative traversal, in-place checked resolution, and a
 deterministic debug printer.
@@ -236,7 +236,7 @@ deterministic debug printer.
 - Examples `quickstart` and `hygiene`; criterion benchmarks at 82k, 825k, and
   1,000,000 nodes; integration, depth, and property tests (with a reference
   implementation of scoping and jumps).
-- The specification `specs/HIR.md` in the LexerSketch plan, including the
+- The specification `specs/HIR.md` in the toolchain's plan, including the
   0.5 designs for the body-graph view (decision D12), the textual syntax, and
   the binary encoding.
 

@@ -1,7 +1,6 @@
 # hir-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../_lexersketch/ROADMAP.md and ../_lexersketch/NEW-LIBS.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -15,7 +14,7 @@ Compiles, CI green, structure correct, no domain logic.
 - [x] Wires span-lang and intern-lang. Property tests for builder/validator invariants.
 
 Delivered:
-- The spec, `../_lexersketch/specs/HIR.md`: every node form, storage, origins and hygiene,
+- The spec, the HIR specification: every node form, storage, origins and hygiene,
   binders, scopes and frames, resolution, types-optional mode, patterns, effects (with the
   mapping onto LSB suspension instructions), intrinsic ops and policies (OPS section 2,
   `promote` included), items, attributes, error nodes, the validation contract, canonical
@@ -162,4 +161,4 @@ Recorded, not done here (per the anti-deferral rule):
 - [ ] Audit against lower-lang, resolve-lang, typeck-lang, and match-lang as real consumers.
 
 ## v1.0.0 - Stable
-- [ ] Frozen only after lower-lang, resolve-lang, and typeck-lang exercise the API end to end (LexerSketch D18).
+- [ ] Frozen only after lower-lang, resolve-lang, and typeck-lang exercise the API end to end (D18).

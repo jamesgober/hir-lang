@@ -8,8 +8,8 @@
 > (OPS v2), lenient repair in at most two rounds, and `lookup_local_in`. (0.3
 > closed the review gaps of 0.2: units, partial resolution, lenient
 > validation, PHP/Mox and low-level forms.) The surface is frozen only after lower-lang,
-> resolve-lang, and typeck-lang have used it end to end (LexerSketch decision
-> D18). The normative definition of HIR is the LexerSketch spec
+> resolve-lang, and typeck-lang have used it end to end (decision
+> D18). The normative definition of HIR is the toolchain's spec
 > `specs/HIR.md`; this file documents the Rust API that implements it. See
 > [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
@@ -53,7 +53,7 @@
 
 ## Overview
 
-`hir-lang` defines the high-level IR every LexerSketch language lowers into. A
+`hir-lang` defines the high-level IR every forged language lowers into. A
 [`Builder`](#builder) creates nodes bottom-up and stamps each with its origin;
 [`finish`](#builderfinish--builderfinish_lenient) validates and returns a
 [`Hir`](#hir), which can be read, walked, printed, and resolved in place.
