@@ -1,13 +1,12 @@
 # hir-lang &mdash; Engineering Directives
 
 > Engineering standards and the definition of done for this project. Read alongside `REPS.md` (root, authoritative) and `dev/ROADMAP.md` (current phase). If anything here conflicts with `REPS.md`, `REPS.md` wins.
-> Family plan: `../_lexersketch/` (README rules of engagement, ARCHITECTURE, ISSUES, ROADMAP).
 
 ---
 
 ## 0. Philosophy
 
-This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is part of the semantic analysis tier (SEMA) of the `-lang` family that LexerSketch assembles.
+This library is built and maintained to a production standard and treated as a flagship piece of work. Plan the full path, then build one verified step at a time. "Good enough" is treated as a defect. It is part of the semantic analysis tier (SEMA) of the `-lang` family that the toolchain assembles.
 
 ---
 
@@ -15,7 +14,7 @@ This library is built and maintained to a production standard and treated as a f
 
 hir-lang defines the HIR: its node forms, its storage (a dense arena with typed ids), its builder, its validator, its origin tracking, a body-graph view for flow-sensitive analysis, a textual form, and a versioned binary encoding. It owns the representation and nothing else: no parsing of surface languages, no name resolution, no type inference, no code generation.
 
-HIR is a load-bearing wall of the LexerSketch architecture. Resolution, type checking, pattern compilation, capabilities, the evaluator, and lowering to SSA are written once against it, so its shape and stability decide the cost of everything above and below it.
+HIR is a load-bearing wall of the toolchain's architecture. Resolution, type checking, pattern compilation, capabilities, the evaluator, and lowering to SSA are written once against it, so its shape and stability decide the cost of everything above and below it.
 
 ---
 
@@ -42,7 +41,7 @@ HIR is a load-bearing wall of the LexerSketch architecture. Resolution, type che
 6. Property tests cover every section-4 invariant; a fuzz target exists for every decoder or parser.
 7. Hot-path changes carry benchmarks; no regression over 5%.
 8. `README.md`, `docs/API.md`, and `CHANGELOG.md` updated; the matching `docs/release/vX.Y.Z.md` written before the tag.
-9. v1.0.0 only after a real consumer has exercised the API end to end (LexerSketch decision D18).
+9. v1.0.0 only after a real consumer has exercised the API end to end (decision D18).
 
 ---
 

@@ -1,11 +1,11 @@
 //! # hir_lang
 //!
-//! The high-level intermediate representation (HIR) of LexerSketch: the one
+//! The high-level intermediate representation (HIR) of the toolchain: the one
 //! structured, expression-oriented IR that every forged language lowers into,
 //! so that name resolution, type checking, pattern compilation, capabilities,
 //! the evaluator, and the lowering to SSA are written once.
 //!
-//! The full definition is `specs/HIR.md` in the LexerSketch plan; this crate
+//! The full definition is `specs/HIR.md` in the toolchain's plan; this crate
 //! implements its node forms, storage, builder, validator, traversal, and
 //! debug printer.
 //!

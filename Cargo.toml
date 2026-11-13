@@ -16,10 +16,10 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "High-level IR for LexerSketch: the structured, typed-optional core every forged language lowers into."
+description = "High-level IR: the structured, typed-optional core every forged language lowers into."
 
 # Keywords (5 max)
-keywords = ["hir", "ir", "compiler", "language", "lexersketch"]
+keywords = ["hir", "ir", "compiler", "language"]
 
 # Categories
 categories = ["compilers", "development-tools", "no-std"]

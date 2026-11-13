@@ -3,7 +3,7 @@
     <br>
     <b>hir-lang</b>
     <br>
-    <sub><sup>LEXERSKETCH HIGH-LEVEL IR</sup></sub>
+    <sub><sup>HIGH-LEVEL IR</sup></sub>
 </h1>
 
 <div align="center">
@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>hir-lang</strong> is the high-level intermediate representation of the LexerSketch toolchain: the one structured, expression-oriented IR that every forged language lowers into, so that name resolution, type checking, pattern compilation, capability passes, the evaluator, and the lowering to SSA are written once and serve every language &mdash; dynamic (Mox), gradual (Mercury), static with generics and ownership (Iron, Kraken), low-level (Zero), query (HQL), and data (NOML).
+        <strong>hir-lang</strong> is the high-level intermediate representation of the toolchain: the one structured, expression-oriented IR that every forged language lowers into, so that name resolution, type checking, pattern compilation, capability passes, the evaluator, and the lowering to SSA are written once and serve every language &mdash; dynamic (Mox), gradual (Mercury), static with generics and ownership (Iron, Kraken), low-level (Zero), query (HQL), and data (NOML).
     </p>
     <p>
         Binders carry unique ids and hygiene marks, so a lowering template's temporaries can never capture a user's variables. Types are optional, so dynamic languages simply leave them out. Patterns, effects (<code>throw</code>, <code>try</code>, <code>await</code>, <code>yield</code>, <code>spawn</code>, <code>defer</code>), and intrinsic operations with their overflow and division policies are explicit. Every node records its source span and the expansion that produced it. Paths resolve partially, the way rustc does (<code>Vec::new</code>, <code>&lt;T as Add&gt;::Output</code>), and across compilation units. A validator stands at the door: a <code>Hir</code> exists only if it is well-formed, and a well-formed <code>Hir</code> cannot make a consumer panic &mdash; while lenient validation turns each user mistake into a reported error node instead of rejecting the whole unit.
